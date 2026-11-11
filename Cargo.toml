@@ -1,0 +1,15 @@
+[package]
+name = "radio-panel"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+iced = { version = "0.14", features = ["tokio", "canvas"] }
+ksni = "0.3"
+libspa = "0.10"
+notify = "8"
+pipewire = "0.10"
+rfd = "0.18"
+rust-ini = "0.21"
+rustfft = "6"
+ureq = { version = "3", default-features = false }
