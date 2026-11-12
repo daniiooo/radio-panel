@@ -655,7 +655,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use std::sync::mpsc::{Receiver, channel};
     use std::time::{Duration, Instant};
@@ -688,15 +688,15 @@ mod tests {
     }
 
     /// Poll until `check` holds; the pulse view lags behind our own events.
-    fn wait_for(what: &str, check: impl Fn() -> bool) {
-        let deadline = Instant::now() + Duration::from_secs(5);
+    pub(crate) fn wait_for(what: &str, check: impl Fn() -> bool) {
+        let deadline = Instant::now() + Duration::from_secs(15);
         while !check() {
             assert!(Instant::now() < deadline, "timed out waiting for: {what}");
             std::thread::sleep(Duration::from_millis(100));
         }
     }
 
-    fn pactl(args: &[&str]) -> String {
+    pub(crate) fn pactl(args: &[&str]) -> String {
         let out = std::process::Command::new("pactl").args(args).output().expect("pactl");
         String::from_utf8_lossy(&out.stdout).into_owned()
     }

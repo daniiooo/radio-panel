@@ -57,6 +57,7 @@ fn defaults() -> Ini {
 }
 
 /// Config: a `rust-ini` store of real (unescaped) text, plus its file path.
+#[derive(Clone)]
 pub struct Config {
     ini: Ini,
     path: PathBuf,
