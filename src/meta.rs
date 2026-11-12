@@ -1,6 +1,18 @@
+//! The track title: read from a watched file or set by hand, and pushed to Icecast
+//! as stream metadata. One thread; commands go in over a channel, events come out
+//! through a callback that runs on that thread.
 #![allow(dead_code)] // until the app uses it
 
 use std::path::Path;
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
+
+use base64::Engine;
+use notify::Watcher;
+
+use crate::config::Config;
+use crate::ffmpeg::quote;
 
 pub fn read_track(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
@@ -25,10 +37,357 @@ pub fn watch_dir(path: &Path) -> Option<&Path> {
         .find(|p| p.is_dir())
 }
 
+pub enum Command {
+    /// Settings were saved: use them and watch the configured track file.
+    Configure(Box<Config>),
+    /// The stream is connected, or no longer is. Metadata is sent only while it is.
+    SetEnabled(bool),
+    /// A title that overrides the track file. An empty one returns to the file.
+    SetManualTitle(String),
+    ReturnToAutomatic,
+    /// Send the current title again, even if the server already has it.
+    SendNow,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub enum Event {
+    /// The title in effect, `-` if there is none.
+    Track(String),
+    /// The status line.
+    Status(String),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq)]
+enum Outcome {
+    Sent,
+    /// Worth another attempt: no answer, or a 5xx.
+    Retry,
+    /// A 4xx: the same request would fail again.
+    Failed,
+}
+
+enum Msg {
+    Command(Command),
+    Quit,
+    FileChanged,
+    Done { request: u64, title: String, generation: u64, outcome: Outcome },
+}
+
+pub struct Handle {
+    tx: Sender<Msg>,
+    thread: Option<JoinHandle<()>>,
+}
+
+impl Handle {
+    pub fn send(&self, command: Command) {
+        let _ = self.tx.send(Msg::Command(command));
+    }
+}
+
+impl Drop for Handle {
+    fn drop(&mut self) {
+        let _ = self.tx.send(Msg::Quit);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+pub fn spawn(config: Box<Config>, on_event: impl Fn(Event) + Send + 'static) -> Handle {
+    let (tx, rx) = channel();
+    let pusher = Pusher {
+        on_event,
+        tx: tx.clone(),
+        config,
+        watcher: None,
+        enabled: false,
+        automatic_title: None,
+        manual_title: None,
+        last_pushed: None,
+        generation: 0,
+        requests: 0,
+        inflight: None,
+        pending: false,
+        pending_force: false,
+        retry_index: 0,
+        debounce_at: None,
+        initial_at: None,
+        retry_at: None,
+    };
+    Handle { tx, thread: Some(std::thread::spawn(move || pusher.run(rx))) }
+}
+
+const RETRY_DELAYS: [Duration; 4] =
+    [Duration::from_secs(2), Duration::from_secs(5), Duration::from_secs(10), Duration::from_secs(30)];
+/// Editors and players write the track file in several steps.
+const DEBOUNCE: Duration = Duration::from_millis(300);
+/// Gives Icecast a moment to register the mount after the stream connected.
+const INITIAL_PUSH: Duration = Duration::from_secs(2);
+/// The Python app had no limit; a request that hangs would block all later titles.
+const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
+
+struct Pusher<F> {
+    on_event: F,
+    tx: Sender<Msg>,
+    config: Box<Config>,
+    watcher: Option<notify::RecommendedWatcher>,
+    enabled: bool,
+    automatic_title: Option<String>,
+    manual_title: Option<String>,
+    last_pushed: Option<String>,
+    /// Counts changes of the title and of `enabled`; the answer to a request from an
+    /// earlier generation says nothing about the current title.
+    generation: u64,
+    requests: u64,
+    /// Number of the request whose answer is awaited. One request at a time.
+    inflight: Option<u64>,
+    /// A push was asked for while a request was in flight.
+    pending: bool,
+    pending_force: bool,
+    retry_index: usize,
+    debounce_at: Option<Instant>,
+    initial_at: Option<Instant>,
+    retry_at: Option<Instant>,
+}
+
+/// Whether `timer` is due; a due timer is cleared.
+fn take_due(timer: &mut Option<Instant>, now: Instant) -> bool {
+    let due = timer.is_some_and(|at| now >= at);
+    if due {
+        *timer = None;
+    }
+    due
+}
+
+impl<F: Fn(Event)> Pusher<F> {
+    fn run(mut self, rx: Receiver<Msg>) {
+        self.rewatch();
+        self.status("Disabled");
+        loop {
+            let message = match [self.debounce_at, self.initial_at, self.retry_at].into_iter().flatten().min() {
+                Some(at) => rx.recv_timeout(at.saturating_duration_since(Instant::now())),
+                None => rx.recv().map_err(|_| RecvTimeoutError::Disconnected),
+            };
+            match message {
+                Ok(Msg::Command(Command::Configure(config))) => {
+                    self.config = config;
+                    self.rewatch();
+                }
+                Ok(Msg::Command(Command::SetEnabled(enabled))) => self.set_enabled(enabled),
+                Ok(Msg::Command(Command::SetManualTitle(title))) => self.set_manual_title(title.trim()),
+                Ok(Msg::Command(Command::ReturnToAutomatic)) => self.set_manual_title(""),
+                Ok(Msg::Command(Command::SendNow)) => {
+                    // Also outdates an in-flight request for the same title.
+                    self.generation += 1;
+                    self.retry_at = None;
+                    self.retry_index = 0;
+                    self.push_current(true);
+                }
+                Ok(Msg::FileChanged) => self.debounce_at = Some(Instant::now() + DEBOUNCE),
+                Ok(Msg::Done { request, title, generation, outcome }) => self.done(request, title, generation, outcome),
+                Err(RecvTimeoutError::Timeout) => {}
+                Ok(Msg::Quit) | Err(RecvTimeoutError::Disconnected) => break,
+            }
+            let now = Instant::now();
+            if take_due(&mut self.debounce_at, now) {
+                self.rewatch();
+            }
+            if take_due(&mut self.initial_at, now) {
+                self.push_current(false);
+            }
+            if take_due(&mut self.retry_at, now) && self.enabled {
+                self.push_current(true);
+            }
+        }
+    }
+
+    fn status(&self, text: impl Into<String>) {
+        (self.on_event)(Event::Status(text.into()));
+    }
+
+    fn effective_title(&self) -> Option<&String> {
+        self.manual_title.as_ref().or(self.automatic_title.as_ref())
+    }
+
+    fn publish_track(&self) {
+        (self.on_event)(Event::Track(self.effective_title().map_or("-", String::as_str).to_string()));
+    }
+
+    /// Watch the track file and read it. The nearest existing parent directory is
+    /// watched too: the file may not exist yet, and replacing it ends its own watch.
+    fn rewatch(&mut self) {
+        self.watcher = None;
+        let path = std::path::absolute(self.config.get("metadata", "track_file")).unwrap_or_default();
+        if let Some(dir) = watch_dir(&path) {
+            let (tx, track) = (self.tx.clone(), path.clone());
+            let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
+                // Our own reads are reported as well; only changes count. The directory
+                // watch reports every entry; only the file and its parents count.
+                if let Ok(event) = event
+                    && !event.kind.is_access()
+                    && event.paths.iter().any(|changed| track.starts_with(changed))
+                {
+                    let _ = tx.send(Msg::FileChanged);
+                }
+            });
+            if let Ok(mut watcher) = watcher {
+                let _ = watcher.watch(dir, notify::RecursiveMode::NonRecursive);
+                let _ = watcher.watch(&path, notify::RecursiveMode::NonRecursive);
+                self.watcher = Some(watcher);
+            }
+        }
+        let title = read_track(&path);
+        if title == self.automatic_title {
+            self.publish_track();
+            return;
+        }
+        self.automatic_title = title;
+        if self.manual_title.is_none() {
+            self.effective_title_changed(false);
+        }
+    }
+
+    fn set_enabled(&mut self, enabled: bool) {
+        if self.enabled == enabled {
+            return;
+        }
+        self.enabled = enabled;
+        self.generation += 1;
+        self.initial_at = None;
+        self.retry_at = None;
+        self.pending = false;
+        self.pending_force = false;
+        if !enabled {
+            self.inflight = None;
+            self.status("Disabled");
+            return;
+        }
+        self.last_pushed = None;
+        self.retry_index = 0;
+        self.status("Waiting for stream");
+        self.initial_at = Some(Instant::now() + INITIAL_PUSH);
+    }
+
+    /// `title` is trimmed; empty means back to the track file.
+    fn set_manual_title(&mut self, title: &str) {
+        let manual = (!title.is_empty()).then(|| title.to_string());
+        if manual == self.manual_title {
+            return;
+        }
+        // Returning to the file is a sync point, even if its title equals one sent
+        // before the override began.
+        let force = manual.is_none();
+        self.manual_title = manual;
+        self.effective_title_changed(force);
+    }
+
+    fn effective_title_changed(&mut self, force: bool) {
+        self.generation += 1;
+        self.retry_at = None;
+        self.retry_index = 0;
+        self.publish_track();
+        self.push_current(force);
+    }
+
+    fn push_current(&mut self, force: bool) {
+        self.publish_track();
+        if !self.enabled {
+            self.status("Disabled");
+            return;
+        }
+        let Some(title) = self.effective_title().cloned() else {
+            self.status("Waiting for title");
+            return;
+        };
+        if self.inflight.is_some() {
+            self.pending = true;
+            self.pending_force |= force;
+            return;
+        }
+        if force {
+            self.retry_at = None;
+        } else if self.retry_at.is_some() {
+            return;
+        } else if self.last_pushed.as_ref() == Some(&title) {
+            self.status("Metadata OK");
+            return;
+        }
+        let host = self.config.get("server", "host").trim();
+        if host.is_empty() {
+            self.status("Metadata failed");
+            return;
+        }
+        // The mount must be the stream's path, leading slash included: ingest
+        // matches the update to the source by it (docs/ingest-compat.md).
+        let mount = format!("/{}", self.config.get("server", "mount").trim_start_matches('/'));
+        let url = format!(
+            "http://{host}:{}/admin/metadata?mount={}&mode=updinfo&charset=UTF-8&song={}",
+            self.config.get("server", "port"),
+            quote(&mount),
+            quote(&title)
+        );
+        let user = match self.config.get("server", "user") {
+            "" => "source",
+            user => user,
+        };
+        let credentials = format!("{user}:{}", self.config.get("server", "source_password"));
+        let authorization = format!("Basic {}", base64::prelude::BASE64_STANDARD.encode(credentials));
+        self.requests += 1;
+        self.inflight = Some(self.requests);
+        self.status("Sending metadata");
+        let (request, generation, tx) = (self.requests, self.generation, self.tx.clone());
+        std::thread::spawn(move || {
+            let agent = ureq::Agent::new_with_config(ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT)).build());
+            let outcome = match agent.get(&url).header("Authorization", &authorization).call() {
+                Ok(_) => Outcome::Sent,
+                Err(ureq::Error::StatusCode(500..)) => Outcome::Retry,
+                Err(ureq::Error::StatusCode(_) | ureq::Error::BadUri(_) | ureq::Error::Http(_)) => Outcome::Failed,
+                Err(_) => Outcome::Retry,
+            };
+            let _ = tx.send(Msg::Done { request, title, generation, outcome });
+        });
+    }
+
+    fn done(&mut self, request: u64, title: String, generation: u64, outcome: Outcome) {
+        if self.inflight != Some(request) {
+            return;
+        }
+        self.inflight = None;
+        let current = self.enabled && generation == self.generation && self.effective_title() == Some(&title);
+        if current {
+            match outcome {
+                Outcome::Sent => {
+                    self.last_pushed = Some(title);
+                    self.retry_index = 0;
+                    self.status("Metadata OK");
+                }
+                Outcome::Retry if self.retry_index < RETRY_DELAYS.len() => {
+                    let delay = RETRY_DELAYS[self.retry_index];
+                    self.retry_index += 1;
+                    self.status(format!("Retrying metadata ({}s)", delay.as_secs()));
+                    self.retry_at = Some(Instant::now() + delay);
+                }
+                _ => self.status("Metadata failed"),
+            }
+        }
+        // Only a newer or forced request may follow at once: a 4xx must not loop
+        // forever on the same title.
+        if self.enabled && (self.pending || !current) {
+            let force = self.pending_force;
+            self.pending = false;
+            self.pending_force = false;
+            if self.retry_at.is_none() {
+                self.push_current(force);
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::path::PathBuf;
+    use std::sync::mpsc::Receiver;
 
     fn temp_dir(name: &str) -> PathBuf {
         let dir = std::env::temp_dir().join(format!("radio-panel-rs-{name}-{}", std::process::id()));
@@ -91,6 +450,183 @@ mod tests {
 
         assert_eq!(watch_dir(Path::new("track.txt")), Some(Path::new(".")));
         assert_eq!(watch_dir(Path::new("")), None);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// A loopback HTTP server. It answers each request with the next status in
+    /// `script` (200 once that is empty) and reports the request line and the
+    /// Authorization header.
+    fn mock_server(script: std::sync::Arc<std::sync::Mutex<Vec<u16>>>) -> (u16, Receiver<(String, String)>) {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let (tx, requests) = channel();
+        std::thread::spawn(move || {
+            for stream in listener.incoming() {
+                let mut stream = stream.unwrap();
+                let lines: Vec<String> =
+                    BufReader::new(&stream).lines().map_while(Result::ok).take_while(|line| !line.is_empty()).collect();
+                let authorization = lines.iter().find_map(|line| line.strip_prefix("authorization: ").or(line.strip_prefix("Authorization: ")));
+                let _ = tx.send((lines[0].clone(), authorization.unwrap_or_default().to_string()));
+                let mut script = script.lock().unwrap();
+                let status = if script.is_empty() { 200 } else { script.remove(0) };
+                let _ = write!(stream, "HTTP/1.1 {status} Mock\r\nContent-Length: 0\r\nConnection: close\r\n\r\n");
+            }
+        });
+        (port, requests)
+    }
+
+    /// Wait for `wanted`, ignoring other events.
+    fn wait(events: &Receiver<Event>, wanted: Event) {
+        crate::streamer::tests::wait_event(events, 15, &format!("{wanted:?}"), |event| *event == wanted);
+    }
+
+    fn status(text: &str) -> Event {
+        Event::Status(text.to_string())
+    }
+
+    fn track(text: &str) -> Event {
+        Event::Track(text.to_string())
+    }
+
+    #[test]
+    fn m3_pushes_titles_with_retry_and_override() {
+        let d = temp_dir("m3");
+        let script = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, requests) = mock_server(script.clone());
+        let request = |song: &str| {
+            let (line, authorization) = requests.recv_timeout(Duration::from_secs(15)).expect("a metadata request");
+            assert_eq!(line, format!("GET /admin/metadata?mount=%2Fmain.mp3&mode=updinfo&charset=UTF-8&song={song} HTTP/1.1"));
+            assert_eq!(authorization, "Basic ZGo6cCB3OjE="); // dj:p w:1
+        };
+        let track_file = d.join("sub/track.txt");
+        let mut config = Config::load(&d.join("none.conf")).unwrap();
+        for (section, key, value) in [
+            ("server", "host", "127.0.0.1"),
+            ("server", "port", port.to_string().as_str()),
+            ("server", "mount", "main.mp3"),
+            ("server", "user", "dj"),
+            ("server", "source_password", "p w:1"),
+            ("metadata", "track_file", track_file.to_str().unwrap()),
+        ] {
+            config.set(section, key, value);
+        }
+        let (tx, events) = channel();
+        let pusher = spawn(Box::new(config.clone()), move |event| drop(tx.send(event)));
+
+        // No track file, stream not connected.
+        wait(&events, track("-"));
+        wait(&events, status("Disabled"));
+        pusher.send(Command::SetEnabled(true));
+        wait(&events, status("Waiting for stream"));
+        wait(&events, status("Waiting for title"));
+
+        // The file appears in a new directory. The first line is the title; a 5xx is
+        // retried two seconds later.
+        script.lock().unwrap().push(500);
+        std::fs::create_dir(d.join("sub")).unwrap();
+        std::fs::write(&track_file, "Artist - Tytuł & x=1\nsecond line\n").unwrap();
+        wait(&events, track("Artist - Tytuł & x=1"));
+        wait(&events, status("Sending metadata"));
+        wait(&events, status("Retrying metadata (2s)"));
+        let retried = Instant::now();
+        wait(&events, status("Metadata OK"));
+        assert!(retried.elapsed() >= Duration::from_millis(1900), "{:?}", retried.elapsed());
+        request("Artist%20-%20Tytu%C5%82%20%26%20x%3D1");
+        request("Artist%20-%20Tytu%C5%82%20%26%20x%3D1");
+
+        // The file is replaced by a rename, then rewritten with the same title.
+        std::fs::write(d.join("sub/new.txt"), "Second\n").unwrap();
+        std::fs::rename(d.join("sub/new.txt"), &track_file).unwrap();
+        wait(&events, track("Second"));
+        wait(&events, status("Metadata OK"));
+        request("Second");
+        std::fs::write(&track_file, "Second\nother\n").unwrap();
+        wait(&events, track("Second"));
+
+        // A manual title overrides the file; the file changing meanwhile sends nothing.
+        pusher.send(Command::SetManualTitle("  Manual  ".into()));
+        wait(&events, track("Manual"));
+        wait(&events, status("Metadata OK"));
+        request("Manual");
+        std::fs::write(&track_file, "Third\n").unwrap();
+        std::thread::sleep(Duration::from_secs(1));
+        pusher.send(Command::ReturnToAutomatic);
+        wait(&events, track("Third"));
+        wait(&events, status("Metadata OK"));
+        request("Third");
+
+        // A resend on request; a 4xx is final.
+        pusher.send(Command::SendNow);
+        wait(&events, status("Sending metadata"));
+        wait(&events, status("Metadata OK"));
+        request("Third");
+        script.lock().unwrap().push(404);
+        pusher.send(Command::SendNow);
+        wait(&events, status("Metadata failed"));
+        request("Third");
+
+        // Saved settings name another track file.
+        std::fs::write(d.join("other.txt"), "Other\n").unwrap();
+        config.set("metadata", "track_file", d.join("other.txt").to_str().unwrap());
+        pusher.send(Command::Configure(Box::new(config)));
+        wait(&events, track("Other"));
+        wait(&events, status("Metadata OK"));
+        request("Other");
+
+        // Off air: titles are still tracked, nothing is sent.
+        pusher.send(Command::SetEnabled(false));
+        wait(&events, status("Disabled"));
+        pusher.send(Command::SetManualTitle("Unsent".into()));
+        wait(&events, status("Disabled"));
+        // Nothing was sent beyond the requests checked above, and reading the file
+        // does not count as a change of it.
+        std::thread::sleep(Duration::from_millis(700));
+        drop(pusher);
+        assert!(requests.try_recv().is_err());
+        assert_eq!(events.try_iter().collect::<Vec<_>>(), []);
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
+    /// The title reaches a local Icecast, and the ingest proxy's master.
+    #[test]
+    fn m4_metadata_reaches_icecast_and_ingest() {
+        use crate::pw::tests::{pactl, wait_for};
+        use crate::streamer::tests::*;
+        let _live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let d = temp_dir("m4");
+        let sink = crate::pw::spawn(SINK, |_| {});
+        wait_for("sink monitor visible to pulse", || pactl(&["list", "short", "sources"]).contains(&format!("{SINK}.monitor")));
+        std::fs::write(d.join("track.txt"), "Zażółć - Gęślą\n").unwrap();
+        let mut config = Config::load(&d.join("none.conf")).unwrap();
+        for (section, key, value) in [
+            ("server", "host", "127.0.0.1"),
+            ("server", "mount", "/main.mp3"),
+            ("metadata", "track_file", d.join("track.txt").to_str().unwrap()),
+        ] {
+            config.set(section, key, value);
+        }
+        let (icecast_port, proxy_port) = (PORT.to_string(), PROXY_PORT.to_string());
+        let on_icecast: fn() -> bool = || icecast_status().contains("Zażółć - Gęślą");
+        let on_master: fn() -> bool = || http_get(MASTER_PORT, "/status").contains("song=Zażółć - Gęślą");
+        let servers = [(icecast_port.as_str(), "source", PASSWORD, on_icecast), (proxy_port.as_str(), "dj", DJ_PASSWORD, on_master)];
+        let _icecast = start_icecast(&d, PORT);
+        let _ingest = start_ingest(&d);
+        for (port, user, password, title_arrived) in servers {
+            for (key, value) in [("port", port), ("user", user), ("source_password", password)] {
+                config.set("server", key, value);
+            }
+            let (tx, stream_events) = channel();
+            let streamer = crate::streamer::spawn(SINK, move |event| drop(tx.send(event)));
+            streamer.send(crate::streamer::Command::GoLive(Box::new(config.clone())));
+            wait_event(&stream_events, 15, "connected", |event| *event == crate::streamer::Event::Connected(true));
+            let (tx, events) = channel();
+            let pusher = spawn(Box::new(config.clone()), move |event| drop(tx.send(event)));
+            pusher.send(Command::SetEnabled(true));
+            wait(&events, status("Metadata OK"));
+            wait_for("the title on the server", title_arrived);
+        }
+        drop(sink);
         let _ = std::fs::remove_dir_all(&d);
     }
 }

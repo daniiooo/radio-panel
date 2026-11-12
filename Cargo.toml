@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [dependencies]
+base64 = "0.23"
 iced = { version = "0.14", features = ["tokio", "canvas"] }
 ksni = "0.3"
 libc = "0.2"

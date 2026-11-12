@@ -3,7 +3,6 @@
 #![allow(dead_code)] // until the UI uses it
 
 use std::io::Read;
-use std::os::unix::process::CommandExt;
 use std::process::{Child, Stdio};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
@@ -322,19 +321,9 @@ impl<F: Fn(Event)> Supervisor<F> {
         }
     }
 
-    /// SIGTERM, then SIGKILL after two seconds.
     fn end_process(&mut self) {
-        let Some(mut child) = self.child.take() else { return };
-        // The child is not reaped yet, so its pid cannot belong to another process.
-        unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
-        let deadline = Instant::now() + Duration::from_secs(2);
-        while matches!(child.try_wait(), Ok(None)) {
-            if Instant::now() >= deadline {
-                let _ = child.kill();
-                let _ = child.wait();
-                break;
-            }
-            std::thread::sleep(Duration::from_millis(20));
+        if let Some(mut child) = self.child.take() {
+            ffmpeg::terminate(&mut child, Duration::from_secs(2));
         }
     }
 }
@@ -345,13 +334,7 @@ fn spawn_ffmpeg(args: &[String], run: u64, tx: Sender<Msg>) -> std::io::Result<C
     let (mut reader, writer) = std::io::pipe()?;
     let mut command = std::process::Command::new(&args[0]);
     command.args(&args[1..]).stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer);
-    // If the panel dies without cleaning up, ffmpeg must not keep broadcasting.
-    unsafe {
-        command.pre_exec(|| {
-            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
-            Ok(())
-        });
-    }
+    ffmpeg::die_with_parent(&mut command);
     let child = command.spawn()?;
     drop(command); // closes our copies of the pipe's write end, so the reader sees its end
     std::thread::spawn(move || {
@@ -367,7 +350,7 @@ fn spawn_ffmpeg(args: &[String], run: u64, tx: Sender<Msg>) -> std::io::Result<C
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use crate::pw::tests::{pactl, wait_for};
 
@@ -375,26 +358,26 @@ mod tests {
         s.to_string()
     }
 
-    const SINK: &str = "radio-dev-stream";
-    const PORT: u16 = 18010;
+    pub(crate) const SINK: &str = "radio-dev-stream";
+    pub(crate) const PORT: u16 = 18010;
     /// The ingest harness: its fake master and the proxy.
-    const MASTER_PORT: u16 = 18011;
-    const PROXY_PORT: u16 = 18012;
-    const PASSWORD: &str = "test-source-pw";
-    const DJ_PASSWORD: &str = "test-dj-pw";
+    pub(crate) const MASTER_PORT: u16 = 18011;
+    pub(crate) const PROXY_PORT: u16 = 18012;
+    pub(crate) const PASSWORD: &str = "test-source-pw";
+    pub(crate) const DJ_PASSWORD: &str = "test-dj-pw";
 
     /// The live tests share the sink and count this process's ffmpeg children.
-    static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    pub(crate) static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     /// A test server; killed on drop.
-    struct Server(Child);
+    pub(crate) struct Server(Child);
 
     fn listening(port: u16) -> bool {
         std::net::TcpStream::connect(("127.0.0.1", port)).is_ok()
     }
 
     /// A local Icecast on `port`.
-    fn start_icecast(dir: &std::path::Path, port: u16) -> Server {
+    pub(crate) fn start_icecast(dir: &std::path::Path, port: u16) -> Server {
         let xml = format!(
             "<icecast><location>test</location><admin>test@localhost</admin><hostname>localhost</hostname>
             <limits><sources>2</sources></limits>
@@ -415,7 +398,7 @@ mod tests {
 
     /// The real ingest proxy code (`tests/ingest`, built here) on `PROXY_PORT`,
     /// forwarding to its fake master on `MASTER_PORT`. Its one DJ is `dj`.
-    fn start_ingest(dir: &std::path::Path) -> Server {
+    pub(crate) fn start_ingest(dir: &std::path::Path) -> Server {
         let binary = dir.join("ingest-proxy-harness");
         let built = std::process::Command::new("go")
             .args(["build", "-o"])
@@ -442,7 +425,7 @@ mod tests {
     }
 
     /// Response to a GET on `port`; empty if it cannot be reached.
-    fn http_get(port: u16, path: &str) -> String {
+    pub(crate) fn http_get(port: u16, path: &str) -> String {
         use std::io::Write;
         let mut body = String::new();
         if let Ok(mut stream) = std::net::TcpStream::connect(("127.0.0.1", port)) {
@@ -453,7 +436,7 @@ mod tests {
     }
 
     /// Mounts the Icecast on `PORT` lists.
-    fn icecast_status() -> String {
+    pub(crate) fn icecast_status() -> String {
         http_get(PORT, "/status-json.xsl")
     }
 
@@ -463,14 +446,14 @@ mod tests {
     }
 
     /// Pids of the ffmpeg processes this test process started.
-    fn ffmpeg_pids() -> Vec<String> {
+    pub(crate) fn ffmpeg_pids() -> Vec<String> {
         let own = std::process::id().to_string();
         let out = std::process::Command::new("pgrep").args(["-P", &own, "-x", "ffmpeg"]).output().expect("pgrep");
         String::from_utf8_lossy(&out.stdout).lines().map(str::to_string).collect()
     }
 
     /// Wait up to `seconds` for the first event `wanted` accepts, ignoring the others.
-    fn wait_event(rx: &Receiver<Event>, seconds: u64, what: &str, wanted: impl Fn(&Event) -> bool) -> Event {
+    pub(crate) fn wait_event<E>(rx: &Receiver<E>, seconds: u64, what: &str, wanted: impl Fn(&E) -> bool) -> E {
         let deadline = Instant::now() + Duration::from_secs(seconds);
         loop {
             match rx.recv_timeout(deadline.saturating_duration_since(Instant::now())) {

@@ -1,6 +1,36 @@
 #![allow(dead_code)] // until the streamer uses it
 
+use std::os::unix::process::CommandExt;
+use std::process::{Child, Command};
+use std::time::{Duration, Instant};
+
 use crate::config::Config;
+
+/// If the panel dies without cleaning up, the child must not keep running. The
+/// signal is tied to the spawning thread, which must outlive the child.
+pub fn die_with_parent(command: &mut Command) {
+    unsafe {
+        command.pre_exec(|| {
+            libc::prctl(libc::PR_SET_PDEATHSIG, libc::SIGTERM);
+            Ok(())
+        });
+    }
+}
+
+/// SIGTERM, then SIGKILL after `grace`. The child must not have been reaped yet,
+/// so that its pid cannot belong to another process.
+pub fn terminate(child: &mut Child, grace: Duration) {
+    unsafe { libc::kill(child.id() as libc::pid_t, libc::SIGTERM) };
+    let deadline = Instant::now() + grace;
+    while matches!(child.try_wait(), Ok(None)) {
+        if Instant::now() >= deadline {
+            let _ = child.kill();
+            let _ = child.wait();
+            break;
+        }
+        std::thread::sleep(Duration::from_millis(20));
+    }
+}
 
 /// (codec args, container, content type) for a format name; unknown -> mp3.
 pub fn audio_encoding(format: &str) -> (&'static [&'static str], &'static str, &'static str) {
