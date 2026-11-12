@@ -3,6 +3,7 @@ mod ffmpeg;
 mod meta;
 mod pw;
 mod recorder;
+mod spectrum;
 mod streamer;
 
 fn main() {
