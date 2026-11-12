@@ -3,7 +3,7 @@
 //! through a callback that runs on that thread. See docs/pipewire-notes.md.
 #![allow(dead_code)] // until the UI uses it
 
-use std::cell::RefCell;
+use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Cursor;
@@ -25,6 +25,9 @@ pub enum Command {
     Monitor(bool),
     /// Output device (sink node name) for local monitoring. WirePlumber remembers it.
     Output(String),
+    /// Tests only: fallback links go to this sink, never to the real default device.
+    #[cfg(test)]
+    FallbackSink(String),
     Quit,
 }
 
@@ -54,7 +57,8 @@ impl Handle {
 }
 
 impl Drop for Handle {
-    /// Ends the thread; the server then removes the sink and the loopback.
+    /// Ends the thread; the server then removes the sink and the loopback. Players linked
+    /// into the sink are first linked to the default sink, so they stay audible.
     fn drop(&mut self) {
         self.send(Command::Quit);
         if let Some(thread) = self.thread.take() {
@@ -187,13 +191,35 @@ struct Sink {
     serial: String,
 }
 
+struct Port {
+    node: u32,
+    /// `audio.channel`, such as `FL`; empty when the port has none.
+    channel: String,
+    input: bool,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Debug)]
+struct Link {
+    out_node: u32,
+    out_port: u32,
+    in_node: u32,
+    in_port: u32,
+}
+
+const EPIPE: i32 = 32;
+
+/// Link property marking a link we made at shutdown (same name as the Python panel).
+const FALLBACK_KEY: &str = "radio.panel.fallback";
+
 /// What the registry has announced, as far as the panel needs it.
 #[derive(Default)]
 struct Graph {
     /// Audio sinks by node id.
     sinks: HashMap<u32, Sink>,
-    /// Links by id: (output node, input node).
-    links: HashMap<u32, (u32, u32)>,
+    ports: HashMap<u32, Port>,
+    links: HashMap<u32, Link>,
+    /// Fallback links left by an earlier run, by link id.
+    leftover: HashMap<u32, Link>,
     default_sink: Option<String>,
     reported: Option<Event>,
 }
@@ -210,8 +236,8 @@ impl Graph {
             .collect();
         sinks.sort_by(|a, b| a.1.cmp(&b.1));
         let current = loopback_node
-            .and_then(|node| self.links.values().find(|(out, _)| *out == node))
-            .and_then(|(_, input)| self.sinks.get(input))
+            .and_then(|node| self.links.values().find(|l| l.out_node == node))
+            .and_then(|l| self.sinks.get(&l.in_node))
             .map(|s| s.name.clone());
         let event = Event::Outputs { sinks, current };
         if self.reported.as_ref() != Some(&event) {
@@ -219,6 +245,81 @@ impl Graph {
             on_event(event);
         }
     }
+}
+
+impl Graph {
+    fn sink_id(&self, name: &str) -> Option<u32> {
+        self.sinks.iter().find(|(_, s)| s.name == name).map(|(id, _)| *id)
+    }
+
+    fn input_port(&self, node: u32, channel: &str) -> Option<u32> {
+        self.ports.iter().find(|(_, p)| p.node == node && p.input && p.channel == channel).map(|(id, _)| *id)
+    }
+
+    fn linked(&self, out_port: u32, in_port: u32) -> bool {
+        self.links.values().any(|l| l.out_port == out_port && l.in_port == in_port)
+    }
+
+    /// Links to make at shutdown: every output port playing into `own` gets a link to the
+    /// same channel of `target`, unless it has one.
+    fn fallback_links(&self, own: &str, target: &str) -> Vec<Link> {
+        let (Some(own), Some(target)) = (self.sink_id(own), self.sink_id(target)) else { return Vec::new() };
+        if own == target {
+            return Vec::new();
+        }
+        let mut wanted: Vec<Link> = self
+            .links
+            .values()
+            .filter(|l| l.in_node == own)
+            .filter_map(|l| {
+                let channel = &self.ports.get(&l.in_port)?.channel;
+                // A link that crosses channels (a mono player upmixed by hand) is not copied.
+                if self.ports.get(&l.out_port).is_some_and(|p| !p.channel.is_empty() && p.channel != *channel) {
+                    return None;
+                }
+                let in_port = self.input_port(target, channel)?;
+                (!self.linked(l.out_port, in_port)).then_some(Link { in_node: target, in_port, ..*l })
+            })
+            .collect();
+        wanted.sort();
+        wanted.dedup();
+        wanted
+    }
+
+    /// Leftover fallback links that can be undone now: (link id, link into `own` to make
+    /// first, if the player is not linked there yet). Waits until our ports are known.
+    fn take_leftovers(&mut self, own: &str) -> Vec<(u32, Option<Link>)> {
+        let Some(own) = self.sink_id(own) else { return Vec::new() };
+        let ready: Vec<(u32, Option<Link>)> = self
+            .leftover
+            .iter()
+            .filter_map(|(id, l)| {
+                let in_port = self.input_port(own, &self.ports.get(&l.in_port)?.channel)?;
+                let back = (!self.linked(l.out_port, in_port)).then_some(Link { in_node: own, in_port, ..*l });
+                Some((*id, back))
+            })
+            .collect();
+        for (id, _) in &ready {
+            self.leftover.remove(id);
+        }
+        ready
+    }
+}
+
+fn make_link(core: &pw::core::CoreRc, link: Link, fallback: bool) -> Option<pw::link::Link> {
+    let ids = [link.out_node, link.out_port, link.in_node, link.in_port].map(|id| id.to_string());
+    let mut props = vec![
+        ("link.output.node", ids[0].as_str()),
+        ("link.output.port", ids[1].as_str()),
+        ("link.input.node", ids[2].as_str()),
+        ("link.input.port", ids[3].as_str()),
+    ];
+    if fallback {
+        // Lingering: the link must outlive our connection.
+        props.extend([("object.linger", "true"), (FALLBACK_KEY, "true")]);
+    }
+    let props: pw::properties::PropertiesBox = props.into_iter().collect();
+    core.create_object::<pw::link::Link>("link-factory", &props).ok()
 }
 
 /// The `name` member of a metadata value such as `{"name":"alsa_output.x"}`.
@@ -331,11 +432,34 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
         }
     };
 
+    // Links we made: fallback undo links must live as long as the connection.
+    let made_links: Rc<RefCell<Vec<pw::link::Link>>> = Rc::default();
+    // Proxies of the links that existed at startup, for their info. Kept to the end:
+    // destroying a proxy after the server removed its link is a protocol error.
+    let link_proxies: Rc<RefCell<Vec<(pw::link::Link, pw::link::LinkListener)>>> = Rc::default();
+    let scanning = Rc::new(Cell::new(true));
+    // Undo fallback links of an earlier run: put the player back on our sink, then
+    // remove the link to the default sink, or it would be heard twice.
+    let undo_leftovers: Rc<dyn Fn()> = Rc::new({
+        let (core, registry, graph, made_links) = (core.clone(), registry.clone(), graph.clone(), made_links.clone());
+        let sink_name = sink_name.to_string();
+        move || {
+            let ready = graph.borrow_mut().take_leftovers(&sink_name);
+            for (leftover, back) in ready {
+                // ponytail: the link back is not confirmed before the leftover goes; if it
+                // fails the port is gone or WirePlumber relinks the player to its target.
+                made_links.borrow_mut().extend(back.and_then(|link| make_link(&core, link, false)));
+                registry.destroy_global(leftover);
+            }
+        }
+    });
+
     let _registry_listener = registry
         .add_listener_local()
         .global({
             let (registry, loopback, on_event) = (registry.clone(), loopback.clone(), on_event.clone());
             let (graph, metadata, report) = (graph.clone(), metadata.clone(), report.clone());
+            let (link_proxies, scanning, undo_leftovers) = (link_proxies.clone(), scanning.clone(), undo_leftovers.clone());
             let sink_name = sink_name.to_string();
             move |global| {
                 let Some(props) = global.props else { return };
@@ -361,10 +485,44 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                             loopback.borrow_mut().node = Some((global.id, node, listener));
                         }
                     }
+                    pw::types::ObjectType::Port => {
+                        let Some(node) = props.get("node.id").and_then(|v| v.parse().ok()) else { return };
+                        let port = Port {
+                            node,
+                            channel: props.get("audio.channel").unwrap_or_default().to_string(),
+                            input: props.get("port.direction") == Some("in"),
+                        };
+                        graph.borrow_mut().ports.insert(global.id, port);
+                        undo_leftovers();
+                        return;
+                    }
                     pw::types::ObjectType::Link => {
                         let id = |key| props.get(key).and_then(|v| v.parse().ok());
-                        if let (Some(out), Some(input)) = (id("link.output.node"), id("link.input.node")) {
-                            graph.borrow_mut().links.insert(global.id, (out, input));
+                        let (Some(out_node), Some(out_port), Some(in_node), Some(in_port)) =
+                            (id("link.output.node"), id("link.output.port"), id("link.input.node"), id("link.input.port"))
+                        else {
+                            return;
+                        };
+                        let link = Link { out_node, out_port, in_node, in_port };
+                        graph.borrow_mut().links.insert(global.id, link);
+                        // The fallback mark is not among the registry properties, only in the
+                        // link's own info. Only links from before our start can carry it.
+                        if scanning.get()
+                            && let Ok(proxy) = registry.bind::<pw::link::Link, _>(global)
+                        {
+                            let listener = proxy
+                                .add_listener_local()
+                                .info({
+                                    let (graph, undo_leftovers) = (graph.clone(), undo_leftovers.clone());
+                                    move |info| {
+                                        if info.props().is_some_and(|p| p.get(FALLBACK_KEY).is_some()) {
+                                            graph.borrow_mut().leftover.insert(info.id(), link);
+                                            undo_leftovers();
+                                        }
+                                    }
+                                })
+                                .register();
+                            link_proxies.borrow_mut().push((proxy, listener));
                         }
                     }
                     pw::types::ObjectType::Metadata if props.get("metadata.name") == Some("default") => {
@@ -398,7 +556,9 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                     }
                     let mut graph = graph.borrow_mut();
                     graph.sinks.remove(&id);
+                    graph.ports.remove(&id);
                     graph.links.remove(&id);
+                    graph.leftover.remove(&id);
                 }
                 report();
             }
@@ -407,13 +567,32 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
 
     let _capture = capture(&core, sink_name, on_event.clone())?;
 
+    // Everything that existed before us has been announced once this comes back.
+    let scan_seq = core.sync(0)?;
+    let quit_seq = Rc::new(Cell::new(None));
+    let fallback_sink: Rc<RefCell<Option<String>>> = Rc::default();
     let _core_listener = core
         .add_listener_local()
+        .done({
+            let (mainloop, scanning, quit_seq) = (mainloop.clone(), scanning.clone(), quit_seq.clone());
+            move |id, seq| {
+                if id != pw::core::PW_ID_CORE {
+                    return;
+                }
+                if seq == scan_seq {
+                    scanning.set(false);
+                }
+                if quit_seq.get() == Some(seq) {
+                    mainloop.quit();
+                }
+            }
+        })
         .error({
             let (mainloop, on_event) = (mainloop.clone(), on_event.clone());
-            move |id, _seq, _res, message| {
-                // id 0 is the core itself: the connection is gone.
-                if id == 0 {
+            move |id, _seq, res, message| {
+                // EPIPE on the core itself: the connection is gone. Other core errors answer
+                // a single request (such as one for an object that just went away).
+                if id == pw::core::PW_ID_CORE && res == -EPIPE {
                     on_event(Event::Failed(message.to_string()));
                     mainloop.quit();
                 }
@@ -424,6 +603,8 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
     let _commands = rx.attach(mainloop.loop_(), {
         let (mainloop, loopback) = (mainloop.clone(), loopback.clone());
         let (graph, metadata) = (graph.clone(), metadata.clone());
+        let (core, quit_seq, fallback_sink) = (core.clone(), quit_seq.clone(), fallback_sink.clone());
+        let sink_name = sink_name.to_string();
         move |command| match command {
             Command::StreamVolume(percent) => set_volume(&sink, percent),
             Command::LocalVolume(percent) => {
@@ -445,7 +626,26 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                 }
                 loopback.output = Some(output);
             }
-            Command::Quit => mainloop.quit(),
+            #[cfg(test)]
+            Command::FallbackSink(name) => *fallback_sink.borrow_mut() = Some(name),
+            Command::Quit => {
+                // Our sink goes away with the connection. Give every player on it a link to
+                // the default sink first: WirePlumber moves them there anyway, but only
+                // after a gap. In tests only a sink the test named is used.
+                let target = fallback_sink.borrow().clone().or_else(|| {
+                    if cfg!(test) { None } else { graph.borrow().default_sink.clone() }
+                });
+                let wanted = target.map(|t| graph.borrow().fallback_links(&sink_name, &t)).unwrap_or_default();
+                for link in &wanted {
+                    // Not dropped: destroying the proxy would take the link with it.
+                    std::mem::forget(make_link(&core, *link, true));
+                }
+                // The server must have the links before it sees us leave.
+                match core.sync(0) {
+                    Ok(seq) if !wanted.is_empty() => quit_seq.set(Some(seq)),
+                    _ => mainloop.quit(),
+                }
+            }
         }
     });
 
@@ -501,6 +701,96 @@ mod tests {
         String::from_utf8_lossy(&out.stdout).into_owned()
     }
 
+    fn sink_exists(name: &str) -> bool {
+        pactl(&["list", "short", "sinks"]).lines().any(|line| line.split('\t').nth(1) == Some(name))
+    }
+
+    /// Input ports the output port `port` is linked to, from `pw-link -l`.
+    fn links_of(port: &str) -> Vec<String> {
+        let out = std::process::Command::new("pw-link").arg("-l").output().expect("pw-link");
+        let (mut found, mut inside) = (Vec::new(), false);
+        for line in String::from_utf8_lossy(&out.stdout).lines() {
+            if !line.starts_with(' ') {
+                inside = line == port;
+            } else if inside && let Some(peer) = line.trim().strip_prefix("|-> ") {
+                found.push(peer.to_string());
+            }
+        }
+        found.sort();
+        found
+    }
+
+    /// A silent player that WirePlumber leaves alone (`--target 0`: no autoconnect), so it
+    /// can never be moved to the real output device. The test links it by hand.
+    struct Player(std::process::Child);
+
+    impl Player {
+        fn start() -> Player {
+            let child = std::process::Command::new("pw-cat")
+                .args(["-p", "-a", "--rate", "48000", "--channels", "2", "--format", "s16", "--target", "0"])
+                .args(["-P", r#"{ node.name = "radio-dev-player" }"#, "/dev/zero"])
+                .spawn()
+                .expect("pw-cat");
+            Player(child)
+        }
+    }
+
+    impl Drop for Player {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+
+    fn graph_with_player() -> Graph {
+        let mut graph = Graph::default();
+        for (id, name) in [(10, "radio-dev"), (20, "out")] {
+            graph.sinks.insert(id, Sink { name: name.into(), description: name.into(), serial: id.to_string() });
+        }
+        // (port, node, channel, input): both sinks, the sink monitor, a stereo and a mono player.
+        for (id, node, channel, input) in [
+            (11, 10, "FL", true), (12, 10, "FR", true), (13, 10, "FL", false),
+            (21, 20, "FL", true), (22, 20, "FR", true),
+            (31, 30, "FL", false), (32, 30, "FR", false), (41, 40, "MONO", false),
+        ] {
+            graph.ports.insert(id, Port { node, channel: channel.into(), input });
+        }
+        graph
+    }
+
+    fn link(out_node: u32, out_port: u32, in_node: u32, in_port: u32) -> Link {
+        Link { out_node, out_port, in_node, in_port }
+    }
+
+    #[test]
+    fn fallback_links_copy_each_player_port_once() {
+        let mut graph = graph_with_player();
+        graph.links.insert(100, link(30, 31, 10, 11));
+        graph.links.insert(101, link(30, 32, 10, 12));
+        graph.links.insert(102, link(30, 31, 20, 21)); // FL already plays to the target
+        graph.links.insert(103, link(40, 41, 10, 11)); // crosses channels: not copied
+        graph.links.insert(104, link(10, 13, 50, 51)); // our monitor feeding a capture
+        assert_eq!(graph.fallback_links("radio-dev", "out"), [link(30, 32, 20, 22)]);
+        assert_eq!(graph.fallback_links("radio-dev", "radio-dev"), []);
+        assert_eq!(graph.fallback_links("radio-dev", "missing"), []);
+    }
+
+    #[test]
+    fn leftovers_wait_for_our_ports_and_skip_existing_links() {
+        let mut graph = graph_with_player();
+        graph.links.insert(100, link(30, 31, 10, 11)); // FL is already back on our sink
+        graph.leftover.insert(200, link(30, 31, 20, 21));
+        graph.leftover.insert(201, link(30, 32, 20, 22));
+        let own_ports: Vec<_> = [11, 12].into_iter().map(|id| (id, graph.ports.remove(&id).unwrap())).collect();
+        assert_eq!(graph.take_leftovers("radio-dev"), []);
+        assert_eq!(graph.leftover.len(), 2);
+        graph.ports.extend(own_ports);
+        let mut ready = graph.take_leftovers("radio-dev");
+        ready.sort();
+        assert_eq!(ready, [(200, None), (201, Some(link(30, 32, 10, 12)))]);
+        assert!(graph.leftover.is_empty());
+    }
+
     #[test]
     fn json_name_reads_the_default_sink_value() {
         assert_eq!(json_name(r#"{"name":"alsa_output.usb-x.analog-stereo"}"#).as_deref(), Some("alsa_output.usb-x.analog-stereo"));
@@ -539,7 +829,7 @@ mod tests {
             }
         });
         expect(&events, Event::Ready);
-        wait_for("sink visible", || pactl(&["list", "short", "sinks"]).contains(SINK));
+        wait_for("sink visible", || sink_exists(SINK));
 
         // Stream volume: set natively, confirmed by our event and by pactl. Wait first:
         // WirePlumber restores the saved volume just after the node appears and would
@@ -597,12 +887,33 @@ mod tests {
         // Monitor off removes the loopback; the sink stays.
         panel.send(Command::Monitor(false));
         wait_for("loopback stream gone", || !loopback_listed());
-        assert!(pactl(&["list", "short", "sinks"]).contains(SINK));
+        assert!(sink_exists(SINK));
+
+        // A player on the sink stays linked when the panel quits: to the fallback sink.
+        let player = Player::start();
+        let (left, right) = ("radio-dev-player:output_FL", "radio-dev-player:output_FR");
+        let on = |sink: &str| (vec![format!("{sink}:playback_FL")], vec![format!("{sink}:playback_FR")]);
+        wait_for("player linked into the sink", || {
+            for (output, input) in [(left, "radio-dev:playback_FL"), (right, "radio-dev:playback_FR")] {
+                let _ = std::process::Command::new("pw-link").args([output, input]).output();
+            }
+            (links_of(left), links_of(right)) == on(SINK)
+        });
+        panel.send(Command::FallbackSink(OUT.into()));
+        drop(panel);
+        wait_for("sink gone", || !sink_exists(SINK));
+        wait_for("player on the fallback sink", || (links_of(left), links_of(right)) == on(OUT));
+
+        // The next start takes the player back and removes the fallback links.
+        let (panel, events) = spawn_with_events(SINK);
+        expect(&events, Event::Ready);
+        wait_for("player back on the sink only", || (links_of(left), links_of(right)) == on(SINK));
+        drop(player);
 
         // Dropping the handle ends the thread and the server removes the sink.
         drop(panel);
         drop(out);
         drop(out2);
-        wait_for("sink gone", || !pactl(&["list", "short", "sinks"]).contains(SINK));
+        wait_for("sinks gone", || ![SINK, OUT, OUT2].iter().any(|s| sink_exists(s)));
     }
 }
