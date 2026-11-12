@@ -73,6 +73,7 @@ pub enum Message {
     Quit,
     Tray(ksni::Handle<PanelTray>),
     NoTray,
+    SystemTheme(iced::theme::Mode),
     Tick,
     Frame,
     Pw(pw::Event),
@@ -111,6 +112,8 @@ struct App {
     backend: Option<Backend>,
     /// Quit is under way; every later message is ignored.
     quitting: bool,
+    /// The desktop asks for a dark color scheme.
+    dark: bool,
     tray: Option<ksni::Handle<PanelTray>>,
     main: Option<window::Id>,
     graph: Option<window::Id>,
@@ -185,7 +188,8 @@ fn boot() -> (App, Task<Message>) {
         }),
     };
     let hidden = std::env::args().any(|argument| argument == "--hidden");
-    (App::new(config, Some(backend)), if hidden { Task::none() } else { Task::done(Message::ToggleMain) })
+    let show = if hidden { Task::none() } else { Task::done(Message::ToggleMain) };
+    (App::new(config, Some(backend)), Task::batch([iced::system::theme().map(Message::SystemTheme), show]))
 }
 
 /// Run `teardown` on a thread of its own and wait for it, at most `limit`. Whether it
@@ -228,6 +232,7 @@ impl App {
             config,
             backend,
             quitting: false,
+            dark: false,
             tray: None,
             main: None,
             graph: None,
@@ -302,6 +307,10 @@ impl App {
             // Without a tray a hidden panel could never be shown.
             Message::NoTray if self.main.is_none() => return self.update(Message::ToggleMain),
             Message::NoTray => {}
+            // Opening a window on Wayland reports "no preference" (iced 0.14.1 then falls
+            // back to light); the desktop's last real answer stands.
+            Message::SystemTheme(iced::theme::Mode::None) => {}
+            Message::SystemTheme(mode) => self.dark = mode == iced::theme::Mode::Dark,
             Message::Tick => return self.tick(),
             Message::Frame => {
                 self.spectrum.advance(self.clock.elapsed().as_secs_f64());
@@ -602,6 +611,10 @@ impl App {
         self.push(meta::Command::Configure(Box::new(self.config.clone())));
     }
 
+    fn theme(&self, _id: window::Id) -> Theme {
+        if self.dark { Theme::Dark } else { Theme::Light }
+    }
+
     fn title(&self, id: window::Id) -> String {
         if self.graph == Some(id) {
             "Radio Panel - Network".into()
@@ -682,7 +695,7 @@ impl App {
             labeled("Host / IP", self.field("server", "host")),
             labeled("Port", self.field("server", "port").width(100)),
             labeled("Mount", self.field("server", "mount")),
-            labeled("Username", self.field("server", "user")),
+            labeled("Username", text_input("source", self.form.get("server", "user")).padding(4).on_input(|value| Message::Field("server", "user", value))),
             labeled("Password", self.field("server", "source_password").secure(true)),
             labeled("Format", pick_list(formats, format, |choice: Choice| Message::Field("audio", "format", choice.value)).padding(PADDING)),
             labeled("Bitrate (kbps)", pick_list(BITRATES, bitrate, |bitrate: &str| Message::Field("audio", "bitrate", bitrate.to_string())).padding(PADDING)),
@@ -738,6 +751,7 @@ impl App {
             Subscription::run(tray),
             window::close_events().map(Message::Closed),
             iced::time::every(TICK).map(|_| Message::Tick),
+            iced::system::theme_changes().map(Message::SystemTheme),
             keyboard::listen().filter_map(|event| match event {
                 keyboard::Event::KeyPressed { key: keyboard::Key::Character(character), modifiers, .. }
                     if modifiers.control() && character.as_str() == "q" =>
@@ -947,6 +961,7 @@ fn tray() -> impl Stream<Item = Message> {
 pub fn run() -> iced::Result {
     iced::daemon(boot, App::update, App::view)
         .title(App::title)
+        .theme(App::theme)
         .subscription(App::subscription)
         .settings(iced::Settings { default_text_size: 14.into(), ..Default::default() })
         .run()
@@ -1083,5 +1098,16 @@ mod tests {
         let _ = app.update(Message::ToggleMain);
         let _ = app.update(state("LIVE", true, true));
         assert_eq!((app.main, app.live), (None, false));
+    }
+
+    #[test]
+    fn u4_no_preference_keeps_the_last_color_scheme() {
+        use iced::theme::Mode;
+        let mut app = app("u4");
+        assert!(!app.dark);
+        for (mode, dark) in [(Mode::Dark, true), (Mode::None, true), (Mode::Light, false), (Mode::None, false)] {
+            let _ = app.update(Message::SystemTheme(mode));
+            assert_eq!(app.dark, dark, "{mode:?}");
+        }
     }
 }
