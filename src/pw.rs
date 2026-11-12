@@ -4,6 +4,7 @@
 #![allow(dead_code)] // until the UI uses it
 
 use std::cell::RefCell;
+use std::collections::HashMap;
 use std::ffi::CString;
 use std::io::Cursor;
 use std::rc::Rc;
@@ -22,8 +23,8 @@ pub enum Command {
     LocalVolume(u32),
     /// Local monitoring on or off (loads or unloads the loopback).
     Monitor(bool),
-    /// Output device for local monitoring; `None` follows the default device.
-    Output(Option<String>),
+    /// Output device (sink node name) for local monitoring. WirePlumber remembers it.
+    Output(String),
     Quit,
 }
 
@@ -33,6 +34,10 @@ pub enum Event {
     Ready,
     StreamVolume(u32),
     LocalVolume(u32),
+    /// Sinks the monitor can play to, as (node name, description), and the one it plays to now.
+    Outputs { sinks: Vec<(String, String)>, current: Option<String> },
+    /// Sink monitor audio for the spectrum: mono, `CAPTURE_RATE`, -1.0..=1.0.
+    Samples(Vec<f32>),
     /// The connection could not be set up or was lost. The thread has ended.
     Failed(String),
 }
@@ -57,6 +62,9 @@ impl Drop for Handle {
         }
     }
 }
+
+/// Sample rate of `Event::Samples`.
+pub const CAPTURE_RATE: u32 = 44100;
 
 /// Sink node name: `RADIO_PANEL_SINK` for dev runs, else `radio`.
 pub fn sink_name() -> String {
@@ -130,6 +138,7 @@ fn watch_volume(node: &pw::node::Node, report: impl Fn(u32) + 'static) -> pw::no
 struct Loopback {
     context: pw::context::ContextRc,
     sink: String,
+    /// Target named in the module arguments; without one WirePlumber restores the saved target.
     output: Option<String>,
     module: *mut pw::sys::pw_impl_module,
     node: Option<(u32, pw::node::Node, pw::node::NodeListener)>,
@@ -172,6 +181,112 @@ impl Loopback {
     }
 }
 
+struct Sink {
+    name: String,
+    description: String,
+    serial: String,
+}
+
+/// What the registry has announced, as far as the panel needs it.
+#[derive(Default)]
+struct Graph {
+    /// Audio sinks by node id.
+    sinks: HashMap<u32, Sink>,
+    /// Links by id: (output node, input node).
+    links: HashMap<u32, (u32, u32)>,
+    default_sink: Option<String>,
+    reported: Option<Event>,
+}
+
+impl Graph {
+    /// Send `Event::Outputs` if the list or the monitor's current sink changed.
+    fn report(&mut self, own_sink: &str, loopback_node: Option<u32>, on_event: &dyn Fn(Event)) {
+        let mut sinks: Vec<_> = self
+            .sinks
+            .values()
+            // Looping the monitor back into our own sink would feed back.
+            .filter(|s| s.name != own_sink)
+            .map(|s| (s.name.clone(), s.description.clone()))
+            .collect();
+        sinks.sort_by(|a, b| a.1.cmp(&b.1));
+        let current = loopback_node
+            .and_then(|node| self.links.values().find(|(out, _)| *out == node))
+            .and_then(|(_, input)| self.sinks.get(input))
+            .map(|s| s.name.clone());
+        let event = Event::Outputs { sinks, current };
+        if self.reported.as_ref() != Some(&event) {
+            self.reported = Some(event.clone());
+            on_event(event);
+        }
+    }
+}
+
+/// The `name` member of a metadata value such as `{"name":"alsa_output.x"}`.
+fn json_name(value: &str) -> Option<String> {
+    let rest = &value[value.find("\"name\"")? + 6..];
+    let rest = &rest[rest.find(':')? + 1..];
+    let rest = &rest[rest.find('"')? + 1..];
+    Some(rest[..rest.find('"')?].to_string())
+}
+
+/// Capture stream on the sink monitor; every buffer goes out as `Event::Samples`.
+fn capture<'c>(
+    core: &'c pw::core::CoreRc, sink_name: &str, on_event: Rc<dyn Fn(Event)>,
+) -> Result<(pw::stream::StreamBox<'c>, pw::stream::StreamListener<()>), pw::Error> {
+    let stream = pw::stream::StreamBox::new(
+        core,
+        &format!("{sink_name}-meter"),
+        pw::properties::properties! {
+            *pw::keys::MEDIA_TYPE => "Audio",
+            *pw::keys::MEDIA_CATEGORY => "Capture",
+            *pw::keys::MEDIA_ROLE => "Music",
+            "target.object" => sink_name,
+            *pw::keys::STREAM_CAPTURE_SINK => "true",
+        },
+    )?;
+    // No RT_PROCESS: process() runs on the loop thread, like every other callback here.
+    let listener = stream
+        .add_local_listener_with_user_data(())
+        .process(move |stream, _| {
+            let Some(mut buffer) = stream.dequeue_buffer() else { return };
+            let Some(data) = buffer.datas_mut().first_mut() else { return };
+            let size = data.chunk().size() as usize;
+            if let Some(bytes) = data.data() {
+                let samples: Vec<f32> =
+                    bytes[..size.min(bytes.len())].as_chunks::<4>().0.iter().map(|b| f32::from_le_bytes(*b)).collect();
+                if !samples.is_empty() {
+                    on_event(Event::Samples(samples));
+                }
+            }
+        })
+        .register()?;
+    let mut info = spa::param::audio::AudioInfoRaw::new();
+    info.set_format(spa::param::audio::AudioFormat::F32LE);
+    info.set_rate(CAPTURE_RATE);
+    info.set_channels(1);
+    let mut position = [0; spa::sys::SPA_AUDIO_MAX_CHANNELS as usize];
+    position[0] = spa::sys::SPA_AUDIO_CHANNEL_MONO;
+    info.set_position(position);
+    let format = PodSerializer::serialize(
+        Cursor::new(Vec::new()),
+        &Value::Object(Object {
+            type_: spa::utils::SpaTypes::ObjectParamFormat.as_raw(),
+            id: ParamType::EnumFormat.as_raw(),
+            properties: info.into(),
+        }),
+    )
+    .expect("format pod")
+    .0
+    .into_inner();
+    stream.connect(
+        spa::utils::Direction::Input,
+        None,
+        pw::stream::StreamFlags::AUTOCONNECT | pw::stream::StreamFlags::MAP_BUFFERS,
+        &mut [Pod::from_bytes(&format).expect("format pod")],
+    )?;
+    Ok((stream, listener))
+}
+
 fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(Event)>) -> Result<(), pw::Error> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
@@ -204,39 +319,93 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
         module: std::ptr::null_mut(),
         node: None,
     }));
+    let graph = Rc::new(RefCell::new(Graph::default()));
+    // The session manager's `default` metadata: default sink out, stream moves in.
+    let metadata: Rc<RefCell<Option<(pw::metadata::Metadata, pw::metadata::MetadataListener)>>> = Rc::default();
+    let report = {
+        let (graph, loopback, on_event) = (graph.clone(), loopback.clone(), on_event.clone());
+        let sink_name = sink_name.to_string();
+        move || {
+            let node = loopback.borrow().node.as_ref().map(|(id, ..)| *id);
+            graph.borrow_mut().report(&sink_name, node, &*on_event);
+        }
+    };
 
     let _registry_listener = registry
         .add_listener_local()
         .global({
             let (registry, loopback, on_event) = (registry.clone(), loopback.clone(), on_event.clone());
+            let (graph, metadata, report) = (graph.clone(), metadata.clone(), report.clone());
             let sink_name = sink_name.to_string();
             move |global| {
-                if global.type_ != pw::types::ObjectType::Node {
-                    return;
+                let Some(props) = global.props else { return };
+                match global.type_ {
+                    pw::types::ObjectType::Node => {
+                        let name = props.get("node.name").unwrap_or_default();
+                        if props.get("media.class") == Some("Audio/Sink") {
+                            let sink = Sink {
+                                name: name.to_string(),
+                                description: props.get("node.description").unwrap_or(name).to_string(),
+                                serial: props.get("object.serial").unwrap_or_default().to_string(),
+                            };
+                            graph.borrow_mut().sinks.insert(global.id, sink);
+                        }
+                        if name == sink_name {
+                            on_event(Event::Ready);
+                        } else if name == loopback.borrow().playback_name()
+                            && let Ok(node) = registry.bind::<pw::node::Node, _>(global)
+                        {
+                            // WirePlumber restores this stream's saved volume itself; we only report it.
+                            let on_event = on_event.clone();
+                            let listener = watch_volume(&node, move |percent| on_event(Event::LocalVolume(percent)));
+                            loopback.borrow_mut().node = Some((global.id, node, listener));
+                        }
+                    }
+                    pw::types::ObjectType::Link => {
+                        let id = |key| props.get(key).and_then(|v| v.parse().ok());
+                        if let (Some(out), Some(input)) = (id("link.output.node"), id("link.input.node")) {
+                            graph.borrow_mut().links.insert(global.id, (out, input));
+                        }
+                    }
+                    pw::types::ObjectType::Metadata if props.get("metadata.name") == Some("default") => {
+                        let Ok(proxy) = registry.bind::<pw::metadata::Metadata, _>(global) else { return };
+                        let listener = proxy
+                            .add_listener_local()
+                            .property({
+                                let graph = graph.clone();
+                                move |subject, key, _type, value| {
+                                    if subject == 0 && key == Some("default.audio.sink") {
+                                        graph.borrow_mut().default_sink = value.and_then(json_name);
+                                    }
+                                    0
+                                }
+                            })
+                            .register();
+                        *metadata.borrow_mut() = Some((proxy, listener));
+                    }
+                    _ => return,
                 }
-                let name = global.props.and_then(|p| p.get("node.name"));
-                if name == Some(sink_name.as_str()) {
-                    on_event(Event::Ready);
-                } else if name == Some(loopback.borrow().playback_name().as_str())
-                    && let Ok(node) = registry.bind::<pw::node::Node, _>(global)
-                {
-                    // WirePlumber restores this stream's saved volume itself; we only report it.
-                    let on_event = on_event.clone();
-                    let listener = watch_volume(&node, move |percent| on_event(Event::LocalVolume(percent)));
-                    loopback.borrow_mut().node = Some((global.id, node, listener));
-                }
+                report();
             }
         })
         .global_remove({
-            let loopback = loopback.clone();
+            let (loopback, graph, report) = (loopback.clone(), graph.clone(), report.clone());
             move |id| {
-                let mut loopback = loopback.borrow_mut();
-                if loopback.node.as_ref().is_some_and(|(node_id, ..)| *node_id == id) {
-                    loopback.node = None;
+                {
+                    let mut loopback = loopback.borrow_mut();
+                    if loopback.node.as_ref().is_some_and(|(node_id, ..)| *node_id == id) {
+                        loopback.node = None;
+                    }
+                    let mut graph = graph.borrow_mut();
+                    graph.sinks.remove(&id);
+                    graph.links.remove(&id);
                 }
+                report();
             }
         })
         .register();
+
+    let _capture = capture(&core, sink_name, on_event.clone())?;
 
     let _core_listener = core
         .add_listener_local()
@@ -254,6 +423,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
 
     let _commands = rx.attach(mainloop.loop_(), {
         let (mainloop, loopback) = (mainloop.clone(), loopback.clone());
+        let (graph, metadata) = (graph.clone(), metadata.clone());
         move |command| match command {
             Command::StreamVolume(percent) => set_volume(&sink, percent),
             Command::LocalVolume(percent) => {
@@ -265,15 +435,15 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
             Command::Monitor(false) => loopback.borrow_mut().unload(),
             Command::Output(output) => {
                 let mut loopback = loopback.borrow_mut();
-                if loopback.output != output {
-                    loopback.output = output;
-                    // ponytail: reload moves the stream with a short gap in local audio only;
-                    // set the `target.object` metadata instead if the gap is audible.
-                    if !loopback.module.is_null() {
-                        loopback.unload();
-                        loopback.load();
-                    }
+                // Moving a live stream is a `target.object` entry in the default metadata,
+                // which is what `pactl move-sink-input` writes; WirePlumber saves it.
+                let serial = graph.borrow().sinks.values().find(|s| s.name == output).map(|s| s.serial.clone());
+                if let (Some((node, ..)), Some((metadata, _)), Some(serial)) =
+                    (&loopback.node, &*metadata.borrow(), serial)
+                {
+                    metadata.set_property(*node, "target.object", Some("Spa:Id"), Some(&serial));
                 }
+                loopback.output = Some(output);
             }
             Command::Quit => mainloop.quit(),
         }
@@ -292,6 +462,7 @@ mod tests {
 
     const SINK: &str = "radio-dev";
     const OUT: &str = "radio-dev-out";
+    const OUT2: &str = "radio-dev-out2";
 
     fn spawn_with_events(sink: &str) -> (Handle, Receiver<Event>) {
         let (tx, rx) = channel();
@@ -331,6 +502,14 @@ mod tests {
     }
 
     #[test]
+    fn json_name_reads_the_default_sink_value() {
+        assert_eq!(json_name(r#"{"name":"alsa_output.usb-x.analog-stereo"}"#).as_deref(), Some("alsa_output.usb-x.analog-stereo"));
+        assert_eq!(json_name(r#"{ "name": "radio-dev" }"#).as_deref(), Some("radio-dev"));
+        assert_eq!(json_name("{}"), None);
+        assert_eq!(json_name(r#"{"name":"#), None);
+    }
+
+    #[test]
     fn percent_mapping_matches_pactl() {
         assert_eq!(linear_to_percent(0.5), 79);
         assert_eq!(linear_to_percent(1.0), 100);
@@ -346,7 +525,19 @@ mod tests {
     fn sink_loopback_and_volumes_on_live_pipewire() {
         let (out, out_events) = spawn_with_events(OUT);
         expect(&out_events, Event::Ready);
-        let (panel, events) = spawn_with_events(SINK);
+        let (out2, out2_events) = spawn_with_events(OUT2);
+        expect(&out2_events, Event::Ready);
+        // Outputs events are deduplicated by the thread, so the test keeps the latest one
+        // instead of fishing for it in the queue.
+        let outputs = std::sync::Arc::new(std::sync::Mutex::new(None));
+        let (tx, events) = channel();
+        let panel = spawn(SINK, {
+            let outputs = outputs.clone();
+            move |event| match event {
+                Event::Outputs { .. } => *outputs.lock().unwrap() = Some(event),
+                other => drop(tx.send(other)),
+            }
+        });
         expect(&events, Event::Ready);
         wait_for("sink visible", || pactl(&["list", "short", "sinks"]).contains(SINK));
 
@@ -360,7 +551,7 @@ mod tests {
 
         // Monitor on: loopback appears, playing into the dev output sink.
         let loopback_listed = || pactl(&["list", "sink-inputs"]).contains("output.radio-dev-local");
-        panel.send(Command::Output(Some(OUT.into())));
+        panel.send(Command::Output(OUT.into()));
         panel.send(Command::Monitor(true));
         // WirePlumber restores whatever volume this stream had last time.
         let Event::LocalVolume(restored) = wait_event(&events, "a local volume", |e| matches!(e, Event::LocalVolume(_)))
@@ -377,6 +568,26 @@ mod tests {
         std::thread::sleep(Duration::from_millis(500));
         assert!(pactl(&["list", "sink-inputs"]).contains(&format!("{target}%")), "local volume did not stick");
 
+        // The device list has both dev outputs and never our own sink. Send the target
+        // again now that the stream exists: a saved target from an aborted run may differ.
+        let playing_to = |target: &'static str| {
+            let outputs = outputs.clone();
+            move || matches!(&*outputs.lock().unwrap(), Some(Event::Outputs { sinks, current })
+                if current.as_deref() == Some(target)
+                    && [OUT, OUT2].iter().all(|o| sinks.iter().any(|(name, _)| name == o))
+                    && !sinks.iter().any(|(name, _)| name == SINK))
+        };
+        panel.send(Command::Output(OUT.into()));
+        wait_for("monitor on the first dev output", playing_to(OUT));
+        // Move the live stream and back, so the saved target stays the first output.
+        panel.send(Command::Output(OUT2.into()));
+        wait_for("monitor moved to the second dev output", playing_to(OUT2));
+        panel.send(Command::Output(OUT.into()));
+        wait_for("monitor moved back", playing_to(OUT));
+
+        // The capture stream delivers the (silent) sink monitor.
+        wait_event(&events, "captured samples", |e| matches!(e, Event::Samples(s) if !s.is_empty()));
+
         // Leave the saved WirePlumber state at 100% for both.
         panel.send(Command::LocalVolume(100));
         expect(&events, Event::LocalVolume(100));
@@ -391,6 +602,7 @@ mod tests {
         // Dropping the handle ends the thread and the server removes the sink.
         drop(panel);
         drop(out);
+        drop(out2);
         wait_for("sink gone", || !pactl(&["list", "short", "sinks"]).contains(SINK));
     }
 }
