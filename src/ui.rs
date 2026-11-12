@@ -145,7 +145,7 @@ struct App {
     stream_volume: Option<u32>,
     local_volume: Option<u32>,
     /// Last volume change made here; the server's echoes of a drag are ignored briefly.
-    volume_touched: Instant,
+    volume_touched: Option<Instant>,
     outputs: Vec<(String, String)>,
     current_output: Option<String>,
 
@@ -259,7 +259,7 @@ impl App {
             audio_ready: false,
             stream_volume: None,
             local_volume: None,
-            volume_touched: now,
+            volume_touched: None,
             outputs: Vec::new(),
             current_output: None,
             spectrum: Spectrum::new(pw::CAPTURE_RATE),
@@ -357,12 +357,12 @@ impl App {
             Message::Output(choice) => self.audio(pw::Command::Output(choice.value)),
             Message::StreamVolume(percent) => {
                 self.stream_volume = Some(percent);
-                self.volume_touched = Instant::now();
+                self.volume_touched = Some(Instant::now());
                 self.audio(pw::Command::StreamVolume(percent));
             }
             Message::LocalVolume(percent) => {
                 self.local_volume = Some(percent);
-                self.volume_touched = Instant::now();
+                self.volume_touched = Some(Instant::now());
                 self.audio(pw::Command::LocalVolume(percent));
             }
             Message::BrowseTrackFile => {
@@ -462,7 +462,7 @@ impl App {
     }
 
     fn audio_event(&mut self, event: pw::Event) -> Task<Message> {
-        let echo_of_drag = self.volume_touched.elapsed() < Duration::from_millis(300);
+        let echo_of_drag = self.volume_touched.is_some_and(|touched| touched.elapsed() < Duration::from_millis(300));
         match event {
             pw::Event::Ready => {
                 self.audio_ready = true;
@@ -1098,6 +1098,22 @@ mod tests {
         let _ = app.update(Message::ToggleMain);
         let _ = app.update(state("LIVE", true, true));
         assert_eq!((app.main, app.live), (None, false));
+    }
+
+    #[test]
+    fn u5_volumes_follow_the_server_except_right_after_a_drag() {
+        let mut app = app("u5");
+        // The first reports arrive within milliseconds of the start.
+        let _ = app.update(Message::Pw(pw::Event::StreamVolume(60)));
+        let _ = app.update(Message::Pw(pw::Event::LocalVolume(40)));
+        assert_eq!((app.stream_volume, app.local_volume), (Some(60), Some(40)));
+        // The server's echo of a drag step must not pull the slider back.
+        let _ = app.update(Message::StreamVolume(30));
+        let _ = app.update(Message::Pw(pw::Event::StreamVolume(31)));
+        assert_eq!(app.stream_volume, Some(30));
+        app.volume_touched = Some(Instant::now() - Duration::from_millis(400));
+        let _ = app.update(Message::Pw(pw::Event::StreamVolume(31)));
+        assert_eq!(app.stream_volume, Some(31));
     }
 
     #[test]
