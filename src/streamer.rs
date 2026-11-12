@@ -1,6 +1,5 @@
 //! The stream to Icecast: one thread supervises ffmpeg. Commands go in over a channel,
 //! events come out through a callback that runs on that thread.
-#![allow(dead_code)] // until the UI uses it
 
 use std::io::Read;
 use std::process::{Child, Stdio};

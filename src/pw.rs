@@ -1,7 +1,6 @@
 //! Native PipeWire layer: one thread owns the connection, the `radio` sink and the
 //! in-process loopback. Commands go in over a pipewire channel, events come out
 //! through a callback that runs on that thread. See docs/pipewire-notes.md.
-#![allow(dead_code)] // until the UI uses it
 
 use std::cell::{Cell, RefCell};
 use std::collections::HashMap;
@@ -73,6 +72,11 @@ pub const CAPTURE_RATE: u32 = 44100;
 /// Sink node name: `RADIO_PANEL_SINK` for dev runs, else `radio`.
 pub fn sink_name() -> String {
     std::env::var("RADIO_PANEL_SINK").ok().filter(|s| !s.is_empty()).unwrap_or_else(|| "radio".into())
+}
+
+/// What players show in their output picker.
+pub fn sink_description(sink: &str) -> String {
+    if sink == "radio" { "Radio Stream".to_string() } else { format!("Radio Stream ({sink})") }
 }
 
 /// pactl percent is cubic: 79% is linear 0.5.
@@ -395,7 +399,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
     let core = context.connect_rc(None)?;
     let registry = core.get_registry_rc()?;
 
-    let description = if sink_name == "radio" { "Radio Stream".to_string() } else { format!("Radio Stream ({sink_name})") };
+    let description = sink_description(sink_name);
     let sink = core.create_object::<pw::node::Node>(
         "adapter",
         &pw::properties::properties! {

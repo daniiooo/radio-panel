@@ -1,4 +1,3 @@
-#![allow(dead_code)] // until the UI uses it
 
 use std::fs;
 use std::os::unix::fs::OpenOptionsExt;

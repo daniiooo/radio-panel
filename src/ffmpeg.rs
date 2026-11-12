@@ -1,4 +1,3 @@
-#![allow(dead_code)] // until the streamer uses it
 
 use std::os::unix::process::CommandExt;
 use std::process::{Child, Command};

@@ -1,7 +1,6 @@
 //! The track title: read from a watched file or set by hand, and pushed to Icecast
 //! as stream metadata. One thread; commands go in over a channel, events come out
 //! through a callback that runs on that thread.
-#![allow(dead_code)] // until the app uses it
 
 use std::path::Path;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};

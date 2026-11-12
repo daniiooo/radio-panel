@@ -5,7 +5,8 @@ mod pw;
 mod recorder;
 mod spectrum;
 mod streamer;
+mod ui;
 
-fn main() {
-    println!("Hello, world!");
+fn main() -> iced::Result {
+    ui::run()
 }

@@ -1,6 +1,5 @@
 //! Local recording: one thread supervises a second ffmpeg that writes a segment file
 //! for each connected stream, with a cue file of track changes beside it.
-#![allow(dead_code)] // until the app uses it
 
 use std::fs::File;
 use std::io::Write;
