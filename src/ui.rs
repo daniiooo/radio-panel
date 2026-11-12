@@ -4,7 +4,7 @@ use std::collections::VecDeque;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
-use iced::futures::channel::mpsc;
+use iced::futures::channel::{mpsc, oneshot};
 use iced::futures::{SinkExt, Stream, StreamExt};
 use iced::widget::{Column, button, canvas, checkbox, column, container, pick_list, row, scrollable, slider, text, text_input};
 use iced::{Center, Color, Element, Fill, Font, Point, Rectangle, Renderer, Size, Subscription, Task, Theme};
@@ -28,6 +28,10 @@ const POOR: f64 = 0.92;
 const DROP: f64 = 0.78;
 /// How often deadlines and the silence warning are checked.
 const TICK: Duration = Duration::from_millis(500);
+/// Longest wait at quit for ffmpeg and the sink to end (the Python app's limit). Past
+/// it the process exits anyway; the server then removes the sink and ffmpeg gets
+/// SIGTERM, but players on the sink get no fallback links.
+const QUIT_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Inner padding of buttons and lists; the window has many rows.
 const PADDING: [u16; 2] = [4, 10];
@@ -105,6 +109,8 @@ struct App {
     /// The settings as edited in the window; they take effect with "Save settings".
     form: Config,
     backend: Option<Backend>,
+    /// Quit is under way; every later message is ignored.
+    quitting: bool,
     tray: Option<ksni::Handle<PanelTray>>,
     main: Option<window::Id>,
     graph: Option<window::Id>,
@@ -182,6 +188,17 @@ fn boot() -> (App, Task<Message>) {
     (App::new(config, Some(backend)), if hidden { Task::none() } else { Task::done(Message::ToggleMain) })
 }
 
+/// Run `teardown` on a thread of its own and wait for it, at most `limit`. Whether it
+/// finished in time; if not, it is left running.
+fn finished_within(limit: Duration, teardown: impl FnOnce() + Send + 'static) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    std::thread::spawn(move || {
+        teardown();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(limit).is_ok()
+}
+
 /// Open the window of `slot`, or close it if it is open.
 fn toggle(slot: &mut Option<window::Id>, name: &str, size: Size, min_size: Size) -> Task<Message> {
     match slot.take() {
@@ -210,6 +227,7 @@ impl App {
             form: config.clone(),
             config,
             backend,
+            quitting: false,
             tray: None,
             main: None,
             graph: None,
@@ -245,6 +263,9 @@ impl App {
     }
 
     fn update(&mut self, message: Message) -> Task<Message> {
+        if self.quitting {
+            return Task::none();
+        }
         match message {
             Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(680.0, 900.0), Size::new(640.0, 300.0)),
             Message::ToggleGraph => return toggle(&mut self.graph, "GRAPH", Size::new(680.0, 200.0), Size::new(600.0, 120.0)),
@@ -260,8 +281,19 @@ impl App {
             }
             Message::Quit => {
                 trace("QUIT");
-                self.backend = None;
-                return iced::exit();
+                self.quitting = true;
+                // Dropping the backend waits for ffmpeg and the sink: not on this thread.
+                let backend = self.backend.take();
+                let (done, ended) = oneshot::channel();
+                std::thread::spawn(move || {
+                    let finished = finished_within(QUIT_TIMEOUT, move || drop(backend));
+                    trace(if finished { "QUIT_DONE" } else { "QUIT_TIMEOUT" });
+                    let _ = done.send(());
+                });
+                // The panel is gone from the screen at once; the process follows.
+                let windows = [self.main, self.graph, self.details].into_iter().flatten().map(window::close);
+                let tray = self.tray.take().map(|tray| Task::future(tray.shutdown()).discard());
+                return Task::batch(windows.chain(tray).chain([Task::future(ended).then(|_| iced::exit())]));
             }
             Message::Tray(handle) => {
                 self.tray = Some(handle);
@@ -1025,5 +1057,31 @@ mod tests {
         let saved = Config::load(&config_file("u2")).unwrap();
         assert_eq!((saved.get("audio", "monitor_enabled"), saved.get("server", "host")), ("false", "127.0.0.1"));
         let _ = std::fs::remove_file(config_file("u2"));
+    }
+
+    #[test]
+    fn u3_quit_waits_for_teardown_up_to_its_limit() {
+        let ran = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let flag = ran.clone();
+        assert!(finished_within(Duration::from_secs(5), move || flag.store(true, std::sync::atomic::Ordering::SeqCst)));
+        assert!(ran.load(std::sync::atomic::Ordering::SeqCst));
+
+        // A teardown that hangs is given up on at the limit, not waited out.
+        let (release, hold) = std::sync::mpsc::channel::<()>();
+        let started = Instant::now();
+        assert!(!finished_within(Duration::from_millis(200), move || {
+            let _ = hold.recv();
+        }));
+        let waited = started.elapsed();
+        assert!(waited >= Duration::from_millis(200) && waited < Duration::from_secs(3), "{waited:?}");
+        drop(release);
+
+        // Once quit is under way, nothing else is acted on.
+        let mut app = app("u3");
+        let _ = app.update(Message::Quit);
+        assert!(app.quitting);
+        let _ = app.update(Message::ToggleMain);
+        let _ = app.update(state("LIVE", true, true));
+        assert_eq!((app.main, app.live), (None, false));
     }
 }
