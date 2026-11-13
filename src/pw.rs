@@ -3,7 +3,7 @@
 //! through a callback that runs on that thread. See docs/pipewire-notes.md.
 
 use std::cell::{Cell, RefCell};
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::ffi::CString;
 use std::io::Cursor;
 use std::rc::Rc;
@@ -225,6 +225,8 @@ struct Graph {
     /// Fallback links left by an earlier run, by link id.
     leftover: HashMap<u32, Link>,
     default_sink: Option<String>,
+    /// Stream nodes to move onto our sink once its serial and the metadata are known.
+    adopt: Vec<u32>,
     reported: Option<Event>,
 }
 
@@ -326,12 +328,64 @@ fn make_link(core: &pw::core::CoreRc, link: Link, fallback: bool) -> Option<pw::
     core.create_object::<pw::link::Link>("link-factory", &props).ok()
 }
 
-/// The `name` member of a metadata value such as `{"name":"alsa_output.x"}`.
-fn json_name(value: &str) -> Option<String> {
-    let rest = &value[value.find("\"name\"")? + 6..];
+/// The string member `key` of a flat JSON object such as `{"name":"alsa_output.x"}`.
+fn json_string(value: &str, key: &str) -> Option<String> {
+    let key = format!("\"{key}\"");
+    let rest = &value[value.find(&key)? + key.len()..];
     let rest = &rest[rest.find(':')? + 1..];
     let rest = &rest[rest.find('"')? + 1..];
     Some(rest[..rest.find('"')?].to_string())
+}
+
+/// WirePlumber's name for a stream in its `stream-properties` state file: `formKey`
+/// in its `node/state-stream.lua` (read in 0.5.19).
+fn stream_key<'a>(prop: impl Fn(&str) -> Option<&'a str>) -> Option<String> {
+    let class = prop("media.class")?;
+    let class = class.strip_prefix("Stream/").unwrap_or(class);
+    if prop("media.role") == Some("Notification") {
+        return Some(format!("{class}:media.role:Notification"));
+    }
+    ["application.id", "application.name", "media.name", "node.name"]
+        .into_iter()
+        .find_map(|key| prop(key).map(|value| format!("{class}:{key}:{value}")))
+}
+
+/// Keys of the streams whose saved target is `sink`, from the text of that state file.
+/// Its keys escape space, `[` and `]` as `\s`, `\o`, `\c` (seen in the file); `\e` for
+/// `=` and `\\` are from WirePlumber's source as remembered, not seen.
+fn streams_saved_to(state: &str, sink: &str) -> HashSet<String> {
+    let unescape = |key: &str| {
+        let (mut plain, mut chars) = (String::new(), key.chars());
+        while let Some(character) = chars.next() {
+            let escaped = if character == '\\' { chars.next() } else { None };
+            plain.push(match escaped {
+                Some('s') => ' ',
+                Some('e') => '=',
+                Some('o') => '[',
+                Some('c') => ']',
+                Some(other) => other,
+                None => character,
+            });
+        }
+        plain
+    };
+    state
+        .lines()
+        .filter_map(|line| line.split_once('='))
+        .filter(|(_, value)| json_string(value, "target").as_deref() == Some(sink))
+        .map(|(key, _)| unescape(key))
+        .collect()
+}
+
+/// The state file text. Tests name the saved streams themselves.
+fn saved_streams_state() -> String {
+    #[cfg(test)]
+    if let Some(state) = tests::SAVED_STATE.lock().unwrap().clone() {
+        return state;
+    }
+    let dir = std::env::var("XDG_STATE_HOME").ok().filter(|dir| !dir.is_empty());
+    let dir = dir.unwrap_or_else(|| format!("{}/.local/state", std::env::var("HOME").unwrap_or_default()));
+    std::fs::read_to_string(format!("{dir}/wireplumber/stream-properties")).unwrap_or_default()
 }
 
 /// Capture stream on the sink monitor; every buffer goes out as `Event::Samples`.
@@ -442,6 +496,26 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
     // destroying a proxy after the server removed its link is a protocol error.
     let link_proxies: Rc<RefCell<Vec<(pw::link::Link, pw::link::LinkListener)>>> = Rc::default();
     let scanning = Rc::new(Cell::new(true));
+    // A player started while our sink did not exist stays on the default device:
+    // WirePlumber applies a saved target only when a stream is created. Move the
+    // streams that are saved to our sink the way pavucontrol would.
+    let saved = Rc::new(streams_saved_to(&saved_streams_state(), sink_name));
+    // Proxies of the playback streams that existed at startup, for their info; kept
+    // to the end like the link proxies.
+    let stream_proxies: Rc<RefCell<Vec<(pw::node::Node, pw::node::NodeListener)>>> = Rc::default();
+    let adopt: Rc<dyn Fn()> = Rc::new({
+        let (graph, metadata) = (graph.clone(), metadata.clone());
+        let sink_name = sink_name.to_string();
+        move || {
+            let mut graph = graph.borrow_mut();
+            let serial = graph.sinks.values().find(|s| s.name == sink_name && !s.serial.is_empty()).map(|s| s.serial.clone());
+            if let (Some(serial), Some((metadata, _))) = (serial, &*metadata.borrow()) {
+                for node in graph.adopt.drain(..) {
+                    metadata.set_property(node, "target.object", Some("Spa:Id"), Some(&serial));
+                }
+            }
+        }
+    });
     // Undo fallback links of an earlier run: put the player back on our sink, then
     // remove the link to the default sink, or it would be heard twice.
     let undo_leftovers: Rc<dyn Fn()> = Rc::new({
@@ -464,6 +538,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
             let (registry, loopback, on_event) = (registry.clone(), loopback.clone(), on_event.clone());
             let (graph, metadata, report) = (graph.clone(), metadata.clone(), report.clone());
             let (link_proxies, scanning, undo_leftovers) = (link_proxies.clone(), scanning.clone(), undo_leftovers.clone());
+            let (saved, stream_proxies, adopt) = (saved.clone(), stream_proxies.clone(), adopt.clone());
             let sink_name = sink_name.to_string();
             move |global| {
                 let Some(props) = global.props else { return };
@@ -487,6 +562,29 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                             let on_event = on_event.clone();
                             let listener = watch_volume(&node, move |percent| on_event(Event::LocalVolume(percent)));
                             loopback.borrow_mut().node = Some((global.id, node, listener));
+                        } else if scanning.get()
+                            && !saved.is_empty()
+                            && props.get("media.class") == Some("Stream/Output/Audio")
+                            && let Ok(node) = registry.bind::<pw::node::Node, _>(global)
+                        {
+                            // The key needs properties the registry does not carry.
+                            let (graph, saved, adopt, first) = (graph.clone(), saved.clone(), adopt.clone(), Cell::new(true));
+                            let listener = node
+                                .add_listener_local()
+                                .info(move |info| {
+                                    // Once: a later move by the user must stand. Like WirePlumber's
+                                    // own restore, leave a stream that names its target alone.
+                                    let Some(props) = info.props().filter(|_| first.replace(false)) else { return };
+                                    if props.get("target.object").is_none()
+                                        && props.get("node.target").is_none()
+                                        && stream_key(|key| props.get(key)).is_some_and(|key| saved.contains(&key))
+                                    {
+                                        graph.borrow_mut().adopt.push(info.id());
+                                        adopt();
+                                    }
+                                })
+                                .register();
+                            stream_proxies.borrow_mut().push((node, listener));
                         }
                     }
                     pw::types::ObjectType::Port => {
@@ -537,7 +635,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                                 let graph = graph.clone();
                                 move |subject, key, _type, value| {
                                     if subject == 0 && key == Some("default.audio.sink") {
-                                        graph.borrow_mut().default_sink = value.and_then(json_name);
+                                        graph.borrow_mut().default_sink = value.and_then(|value| json_string(value, "name"));
                                     }
                                     0
                                 }
@@ -547,6 +645,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                     }
                     _ => return,
                 }
+                adopt();
                 report();
             }
         })
@@ -668,6 +767,9 @@ pub(crate) mod tests {
     const OUT: &str = "radio-dev-out";
     const OUT2: &str = "radio-dev-out2";
 
+    /// Stands in for WirePlumber's state file while a test runs.
+    pub(crate) static SAVED_STATE: std::sync::Mutex<Option<String>> = std::sync::Mutex::new(None);
+
     fn spawn_with_events(sink: &str) -> (Handle, Receiver<Event>) {
         let (tx, rx) = channel();
         (spawn(sink, move |event| drop(tx.send(event))), rx)
@@ -732,7 +834,7 @@ pub(crate) mod tests {
         fn start() -> Player {
             let child = std::process::Command::new("pw-cat")
                 .args(["-p", "-a", "--rate", "48000", "--channels", "2", "--format", "s16", "--target", "0"])
-                .args(["-P", r#"{ node.name = "radio-dev-player" }"#, "/dev/zero"])
+                .args(["-P", r#"{ node.name = "radio-dev-player" application.name = "radio-dev-player" }"#, "/dev/zero"])
                 .spawn()
                 .expect("pw-cat");
             Player(child)
@@ -744,6 +846,22 @@ pub(crate) mod tests {
             let _ = self.0.kill();
             let _ = self.0.wait();
         }
+    }
+
+    /// (id, object.serial) of the node called `name`, from `pw-cli ls Node`.
+    fn node_ids(name: &str) -> Option<(String, String)> {
+        let out = std::process::Command::new("pw-cli").args(["ls", "Node"]).output().expect("pw-cli");
+        let (mut id, mut serial) = (String::new(), String::new());
+        for line in String::from_utf8_lossy(&out.stdout).lines().map(str::trim) {
+            if let Some(rest) = line.strip_prefix("id ") {
+                id = rest.split(',').next().unwrap_or_default().to_string();
+            } else if let Some(value) = line.strip_prefix("object.serial = ") {
+                serial = value.trim_matches('"').to_string();
+            } else if line.strip_prefix("node.name = ").is_some_and(|value| value.trim_matches('"') == name) {
+                return Some((id, serial));
+            }
+        }
+        None
     }
 
     fn graph_with_player() -> Graph {
@@ -796,11 +914,52 @@ pub(crate) mod tests {
     }
 
     #[test]
-    fn json_name_reads_the_default_sink_value() {
-        assert_eq!(json_name(r#"{"name":"alsa_output.usb-x.analog-stereo"}"#).as_deref(), Some("alsa_output.usb-x.analog-stereo"));
-        assert_eq!(json_name(r#"{ "name": "radio-dev" }"#).as_deref(), Some("radio-dev"));
-        assert_eq!(json_name("{}"), None);
-        assert_eq!(json_name(r#"{"name":"#), None);
+    fn json_string_reads_the_default_sink_value() {
+        let name = |value| json_string(value, "name");
+        assert_eq!(name(r#"{"name":"alsa_output.usb-x.analog-stereo"}"#).as_deref(), Some("alsa_output.usb-x.analog-stereo"));
+        assert_eq!(name(r#"{ "name": "radio-dev" }"#).as_deref(), Some("radio-dev"));
+        assert_eq!(name("{}"), None);
+        assert_eq!(name(r#"{"name":"#), None);
+    }
+
+    #[test]
+    fn stream_key_follows_wireplumber() {
+        let key = |props: &[(&'static str, &'static str)]| {
+            let props = props.to_vec();
+            stream_key(move |wanted| props.iter().find(|(name, _)| *name == wanted).map(|(_, value)| *value))
+        };
+        let class = ("media.class", "Stream/Output/Audio");
+        let aimp = [class, ("application.name", "PipeWire ALSA [AIMP]"), ("media.name", "ALSA Playback"), ("node.name", "alsa_playback.AIMP")];
+        assert_eq!(key(&aimp).as_deref(), Some("Output/Audio:application.name:PipeWire ALSA [AIMP]"));
+        // application.id comes first; only the Notification role replaces the application.
+        assert_eq!(key(&[class, ("application.name", "n"), ("application.id", "i")]).as_deref(), Some("Output/Audio:application.id:i"));
+        assert_eq!(key(&[class, ("media.role", "Music"), ("media.name", "m"), ("node.name", "x")]).as_deref(), Some("Output/Audio:media.name:m"));
+        assert_eq!(key(&[class, ("media.role", "Notification"), ("application.name", "n")]).as_deref(), Some("Output/Audio:media.role:Notification"));
+        assert_eq!(key(&[class, ("node.name", "x")]).as_deref(), Some("Output/Audio:node.name:x"));
+        assert_eq!(key(&[("media.class", "Audio/Sink"), ("node.name", "x")]).as_deref(), Some("Audio/Sink:node.name:x"));
+        assert_eq!(key(&[class]), None);
+        assert_eq!(key(&[("node.name", "x")]), None);
+    }
+
+    #[test]
+    fn saved_streams_are_read_from_the_state_file() {
+        // The first three lines are copied from a real file.
+        let state = r#"[stream-properties]
+Output/Audio:application.name:PipeWire\sALSA\s\oAIMP\c={"volume":1.000000, "channelVolumes":[1.000000, 1.000000], "mute":false, "target":"radio", "channelMap":["FL", "FR"]}
+Audio/Sink:node.name:radio={"volume":1.000000, "mute":false, "channelMap":["FL", "FR"], "channelVolumes":[1.000000, 1.000000]}
+Output/Audio:media.name:radio-dev-local\soutput={"volume":1.000000, "target":"radio-dev-out", "mute":false}
+Output/Audio:application.name:a\eb\\c={"target":"radio"}
+Output/Audio:application.name:other={"target":"radio2"}
+"#;
+        let keys = |sink| {
+            let mut keys: Vec<_> = streams_saved_to(state, sink).into_iter().collect();
+            keys.sort();
+            keys
+        };
+        assert_eq!(keys("radio"), ["Output/Audio:application.name:PipeWire ALSA [AIMP]", "Output/Audio:application.name:a=b\\c"]);
+        assert_eq!(keys("radio-dev-out"), ["Output/Audio:media.name:radio-dev-local output"]);
+        assert!(keys("radio-dev").is_empty());
+        assert!(streams_saved_to("", "radio").is_empty());
     }
 
     #[test]
@@ -908,10 +1067,21 @@ pub(crate) mod tests {
         wait_for("sink gone", || !sink_exists(SINK));
         wait_for("player on the fallback sink", || (links_of(left), links_of(right)) == on(OUT));
 
-        // The next start takes the player back and removes the fallback links.
+        // The next start takes the player back and removes the fallback links. The player
+        // is also saved to our sink, as if routed there in pavucontrol: it gets our sink
+        // as its target. WirePlumber does not act on that for a player without autoconnect.
+        let state = r#"Output/Audio:application.name:radio-dev-player={"target":"radio-dev"}"#;
+        *SAVED_STATE.lock().unwrap() = Some(state.into());
         let (panel, events) = spawn_with_events(SINK);
         expect(&events, Event::Ready);
+        *SAVED_STATE.lock().unwrap() = None;
         wait_for("player back on the sink only", || (links_of(left), links_of(right)) == on(SINK));
+        wait_for("player targeted at the sink", || {
+            let (Some((player, _)), Some((_, sink))) = (node_ids("radio-dev-player"), node_ids(SINK)) else { return false };
+            let out = std::process::Command::new("pw-metadata").args(["-n", "default"]).output().expect("pw-metadata");
+            String::from_utf8_lossy(&out.stdout).contains(&format!("id:{player} key:'target.object' value:'{sink}'"))
+        });
+        assert_eq!((links_of(left), links_of(right)), on(SINK));
         drop(player);
 
         // Dropping the handle ends the thread and the server removes the sink.
