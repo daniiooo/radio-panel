@@ -1,12 +1,13 @@
 //! The windows, the tray, and the glue between them and the backend threads.
 
 use std::collections::VecDeque;
-use std::sync::Mutex;
+use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
 use iced::futures::channel::{mpsc, oneshot};
 use iced::futures::{SinkExt, Stream, StreamExt};
-use iced::widget::{Column, button, canvas, checkbox, column, container, pick_list, row, scrollable, slider, text, text_input};
+use iced::widget::{Column, button, canvas, checkbox, column, container, pick_list, row, scrollable, slider, space, text, text_input, toggler};
+use iced::theme::Palette;
 use iced::{Center, Color, Element, Fill, Font, Point, Rectangle, Renderer, Size, Subscription, Task, Theme};
 use iced::{keyboard, mouse, window};
 use ksni::TrayMethods;
@@ -19,6 +20,16 @@ const GREEN: Color = Color::from_rgb8(0x2f, 0x9e, 0x44);
 const YELLOW: Color = Color::from_rgb8(0xf2, 0xc0, 0x37);
 const ORANGE: Color = Color::from_rgb8(0xe8, 0x59, 0x0c);
 const RED: Color = Color::from_rgb8(0xe0, 0x31, 0x31);
+const GREY: Color = Color::from_rgb8(0x8a, 0x8a, 0x8a);
+/// Neutral greys with one blue accent, close to Plasma's Breeze.
+static DARK: LazyLock<Theme> = LazyLock::new(|| {
+    let palette = Palette { background: Color::from_rgb8(0x1d, 0x1f, 0x22), text: Color::from_rgb8(0xe6, 0xe8, 0xea), primary: Color::from_rgb8(0x3d, 0xae, 0xe9), success: GREEN, warning: YELLOW, danger: RED };
+    Theme::custom("Radio Panel Dark", palette)
+});
+static LIGHT: LazyLock<Theme> = LazyLock::new(|| {
+    let palette = Palette { background: Color::from_rgb8(0xf6, 0xf7, 0xf8), text: Color::from_rgb8(0x23, 0x26, 0x29), primary: Color::from_rgb8(0x1f, 0x8a, 0xc7), success: GREEN, warning: YELLOW, danger: RED };
+    Theme::custom("Radio Panel Light", palette)
+});
 const BOLD: Font = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
 
 /// Upload rate samples kept for the network graph: 60 s at one per 200 ms.
@@ -33,8 +44,14 @@ const TICK: Duration = Duration::from_millis(500);
 /// SIGTERM, but players on the sink get no fallback links.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(7);
 
-/// Inner padding of buttons and lists; the window has many rows.
-const PADDING: [u16; 2] = [4, 10];
+/// Inner padding of buttons, lists and text fields.
+const PADDING: [u16; 2] = [5, 10];
+/// Corner radius of the controls; the cards use a little more.
+const RADIUS: f32 = 6.0;
+/// Space between the cards.
+const GAP: f32 = 8.0;
+/// Width of the label column of the levels.
+const LABEL: f32 = 64.0;
 
 const BITRATES: [&str; 4] = ["128", "192", "256", "320"];
 const FORMATS: [(&str, &str); 3] = [("mp3", "MP3"), ("opus", "Opus"), ("vorbis", "Vorbis")];
@@ -64,8 +81,16 @@ impl std::fmt::Display for Choice {
     }
 }
 
+#[derive(Clone, Copy, PartialEq)]
+pub enum Page {
+    OnAir,
+    Settings,
+}
+
 #[derive(Clone)]
 pub enum Message {
+    Page(Page),
+    Revert,
     ToggleMain,
     ToggleGraph,
     ToggleDetails,
@@ -118,6 +143,7 @@ struct App {
     main: Option<window::Id>,
     graph: Option<window::Id>,
     details: Option<window::Id>,
+    page: Page,
 
     status: String,
     live: bool,
@@ -237,6 +263,7 @@ impl App {
             main: None,
             graph: None,
             details: None,
+            page: Page::OnAir,
             status: "Off air".into(),
             live: false,
             error: false,
@@ -272,7 +299,9 @@ impl App {
             return Task::none();
         }
         match message {
-            Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(680.0, 900.0), Size::new(640.0, 300.0)),
+            Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(460.0, 540.0), Size::new(400.0, 300.0)),
+            Message::Page(page) => self.page = page,
+            Message::Revert => self.form = self.config.clone(),
             Message::ToggleGraph => return toggle(&mut self.graph, "GRAPH", Size::new(680.0, 200.0), Size::new(600.0, 120.0)),
             Message::ToggleDetails => return toggle(&mut self.details, "DETAILS", Size::new(640.0, 320.0), Size::new(320.0, 160.0)),
             Message::Closed(id) => {
@@ -612,7 +641,7 @@ impl App {
     }
 
     fn theme(&self, _id: window::Id) -> Theme {
-        if self.dark { Theme::Dark } else { Theme::Light }
+        if self.dark { DARK.clone() } else { LIGHT.clone() }
     }
 
     fn title(&self, id: window::Id) -> String {
@@ -638,111 +667,169 @@ impl App {
     }
 
     fn field(&self, section: &'static str, key: &'static str) -> iced::widget::TextInput<'_, Message> {
-        text_input("", self.form.get(section, key)).padding(4).on_input(move |value| Message::Field(section, key, value))
+        input("", self.form.get(section, key)).on_input(move |value| Message::Field(section, key, value))
     }
 
     fn flag<'a>(&self, label: &'a str, section: &'static str, key: &'static str) -> iced::widget::Checkbox<'a, Message> {
         checkbox(self.form.get(section, key) == "true").label(label).on_toggle(move |on| Message::Field(section, key, on.to_string()))
     }
 
+    /// Two pages in one window: what is used on air, and the settings, which are
+    /// needed once.
     fn view_main(&self) -> Element<'_, Message> {
+        let unsaved = self.form != self.config;
+        let tabs = row![
+            tab("On air", Page::OnAir, self.page),
+            tab(if unsaved { "Settings \u{2022}" } else { "Settings" }, Page::Settings, self.page),
+        ]
+        .spacing(4);
+        let page = match self.page {
+            Page::OnAir => self.view_on_air(),
+            Page::Settings => self.view_settings(unsaved),
+        };
+        column![tabs, page].spacing(GAP).padding(12).into()
+    }
+
+    fn view_on_air(&self) -> Element<'_, Message> {
         let (status, color) = match self.warning {
             Some(warning) => (warning, Some(ORANGE)),
             None if self.live => (self.status.as_str(), Some(GREEN)),
             None => (self.status.as_str(), self.error.then_some(RED)),
         };
+        let pending = self.autoconnect_at.is_some();
+        let lamp = match color {
+            Some(color) => color,
+            None if self.want_live || pending => YELLOW,
+            None => GREY,
+        };
+        let server = |key| self.config.get("server", key).trim();
+        let target = format!("{}:{}/{}", server("host"), server("port"), server("mount").trim_start_matches('/'));
+        // The reason of a failure takes the place of the target.
+        let (status, reason) = headline(status);
+        let detail = match reason {
+            "" if self.live => format!("{}  \u{2022}  {target}", clock(self.connected_at.elapsed().as_secs())),
+            "" => target,
+            reason => reason.to_string(),
+        };
+        let (label, style): (_, fn(&Theme, button::Status) -> button::Style) = match (pending, self.want_live) {
+            (true, _) => ("Cancel", button::secondary),
+            (_, true) => ("Stop", button::danger),
+            _ => ("Go Live", button::primary),
+        };
         let header = row![
-            text(status).font(BOLD).color_maybe(color).width(Fill),
-            action("Network").on_press(Message::ToggleGraph),
-            action("Details").on_press_maybe((!self.diagnostic.is_empty()).then_some(Message::ToggleDetails)),
-            if self.want_live {
-                button("Stop").padding(PADDING).style(button::danger).on_press(Message::ToggleLive)
-            } else {
-                button("Go Live").padding(PADDING).on_press(Message::ToggleLive)
-            },
+            lamp_dot(lamp),
+            column![text(status).size(16).font(BOLD).color_maybe(color), text(detail).size(12).style(text::secondary)].spacing(2).width(Fill),
+            button(text(label).font(BOLD).width(Fill).center()).width(96).padding([8, 0]).style(rounded(style)).on_press(Message::ToggleLive),
         ]
-        .spacing(8)
+        .spacing(10)
         .align_y(Center);
+
+        let title = match self.track.as_str() {
+            "-" => text("Nothing playing").size(17).style(text::secondary),
+            track => text(track).size(17),
+        };
+        let source = if self.override_active { "Manual override active" } else { "Automatic title" };
+        let now_playing = column![
+            caption("NOW PLAYING"),
+            title,
+            row![
+                input("Title to send", &self.manual_title).on_input(Message::ManualTitle).on_submit(Message::SendTitle),
+                action("Send").on_press(Message::SendTitle),
+                action("Automatic").on_press_maybe(self.override_active.then_some(Message::ReturnToAutomatic)),
+            ]
+            .spacing(6),
+            text(format!("{source}  \u{2022}  {}", self.metadata_status)).size(12).style(text::secondary),
+        ]
+        .spacing(6);
 
         let outputs: Vec<Choice> = self.outputs.iter().map(|(name, description)| Choice { value: name.clone(), label: description.clone() }).collect();
         let current = outputs.iter().find(|choice| Some(&choice.value) == self.current_output.as_ref()).cloned();
-        let hint = format!(
-            "Players see an output named \"{}\" while the panel runs - anything routed there goes on stream.",
-            pw::sink_description(&pw::sink_name())
-        );
-        let devices = column![
-            text(hint).style(text::secondary),
-            labeled(
-                "Local monitor",
-                row![
-                    checkbox(self.form.get("audio", "monitor_enabled") == "true").on_toggle(Message::Monitor),
-                    pick_list(outputs, current, Message::Output).padding(PADDING).width(Fill),
-                ]
-                .spacing(8)
-                .align_y(Center),
-            ),
-        ];
+        let hint = format!("Players routed to the output \"{}\" go on stream.", pw::sink_description(&pw::sink_name()));
+        let levels = column![
+            caption("LEVELS"),
+            level("Stream", self.stream_volume, "--", Message::StreamVolume),
+            level("Monitor", self.local_volume, "off", Message::LocalVolume),
+            row![
+                // A switch: it acts at once, unlike the checkboxes of the settings page.
+                container(toggler(self.form.get("audio", "monitor_enabled") == "true").on_toggle(Message::Monitor)).width(LABEL),
+                pick_list(outputs, current, Message::Output).placeholder("Monitor output").padding(PADDING).style(rounded_list).width(Fill),
+            ]
+            .spacing(8)
+            .align_y(Center),
+            text(hint).size(12).style(text::secondary),
+        ]
+        .spacing(8);
 
-        let volumes = column![
-            labeled("Stream", volume(self.stream_volume, "--", Message::StreamVolume)),
-            labeled("Local", volume(self.local_volume, "off", Message::LocalVolume)),
-        ];
+        let rate = match self.history.back() {
+            Some(kbps) if self.live => format!("{kbps:.0} kbps"),
+            _ => "Network".into(),
+        };
+        let mut footer = row![text(self.recording_status.as_str()).size(12).style(text::secondary).width(Fill)].spacing(4).align_y(Center);
+        if !self.diagnostic.is_empty() {
+            footer = footer.push(link("Details".into(), None).on_press(Message::ToggleDetails));
+        }
+        footer = footer.push(link(rate, self.net_poor.then_some(ORANGE)).on_press(Message::ToggleGraph));
 
+        let content = column![card(header), card(now_playing), card(canvas(Bars(&self.spectrum)).width(Fill).height(56)), card(levels), footer].spacing(GAP);
+        scrollable(content).spacing(4).into()
+    }
+
+    fn view_settings(&self, unsaved: bool) -> Element<'_, Message> {
         let formats: Vec<Choice> = FORMATS.iter().map(|(value, label)| Choice { value: value.to_string(), label: label.to_string() }).collect();
         let format = formats.iter().find(|choice| choice.value == self.form.get("audio", "format")).or(formats.first()).cloned();
         let bitrate = BITRATES.into_iter().find(|bitrate| *bitrate == self.form.get("audio", "bitrate"));
-        let server = column![
-            labeled("Host / IP", self.field("server", "host")),
-            labeled("Port", self.field("server", "port").width(100)),
-            labeled("Mount", self.field("server", "mount")),
-            labeled("Username", text_input("source", self.form.get("server", "user")).padding(4).on_input(|value| Message::Field("server", "user", value))),
-            labeled("Password", self.field("server", "source_password").secure(true)),
-            labeled("Format", pick_list(formats, format, |choice: Choice| Message::Field("audio", "format", choice.value)).padding(PADDING)),
-            labeled("Bitrate (kbps)", pick_list(BITRATES, bitrate, |bitrate: &str| Message::Field("audio", "bitrate", bitrate.to_string())).padding(PADDING)),
-            labeled("Stream name", self.field("server", "stream_name")),
-            labeled("Genre", self.field("server", "genre")),
-            labeled("Description", self.field("server", "description")),
-            labeled("Stream URL", self.field("server", "stream_url")),
-            labeled("Silence warning (s, 0 off)", self.field("audio", "silence_warning_seconds").width(100)),
-            labeled("", self.flag("List in public directory", "server", "public")),
-            labeled("", self.flag("Connect automatically on startup", "server", "autoconnect")),
-        ];
+        let pair = |left, right| row![left, right].spacing(8).align_y(iced::Bottom);
 
-        let track_info = column![
-            row![self.field("metadata", "track_file"), action("Browse...").on_press(Message::BrowseTrackFile)].spacing(8),
+        let server = column![
+            caption("SERVER"),
+            pair(top("Host / IP", self.field("server", "host")), top("Port", self.field("server", "port")).width(90)),
+            top("Mount", self.field("server", "mount")),
+            pair(
+                top("Username", input("source", self.form.get("server", "user")).on_input(|value| Message::Field("server", "user", value))),
+                top("Password", self.field("server", "source_password").secure(true)),
+            ),
+            self.flag("Connect automatically on startup", "server", "autoconnect"),
+        ];
+        let audio = column![
+            caption("AUDIO"),
             row![
-                text_input("Automatic title", &self.manual_title).padding(4).on_input(Message::ManualTitle).on_submit(Message::SendTitle),
-                action("Send now").on_press(Message::SendTitle),
-                action("Return to automatic").on_press_maybe(self.override_active.then_some(Message::ReturnToAutomatic)),
+                top("Format", pick_list(formats, format, |choice: Choice| Message::Field("audio", "format", choice.value)).padding(PADDING).style(rounded_list).width(Fill)),
+                top(
+                    "Bitrate (kbps)",
+                    pick_list(BITRATES, bitrate, |bitrate: &str| Message::Field("audio", "bitrate", bitrate.to_string())).padding(PADDING).style(rounded_list).width(Fill),
+                ),
             ]
             .spacing(8),
-            text(if self.override_active { "Manual override active" } else { "Automatic title" }),
-            text(self.metadata_status.as_str()),
+            row![text("Warn after"), self.field("audio", "silence_warning_seconds").width(60), text("seconds of silence (0 = never)")].spacing(8).align_y(Center),
         ];
-
+        let station = column![
+            caption("STATION"),
+            pair(top("Stream name", self.field("server", "stream_name")), top("Genre", self.field("server", "genre"))),
+            top("Description", self.field("server", "description")),
+            top("Stream URL", self.field("server", "stream_url")),
+            self.flag("List in public directory", "server", "public"),
+        ];
+        let track_info = column![
+            caption("TRACK TITLE"),
+            top("File the player writes the title to", row![self.field("metadata", "track_file"), action("Browse...").on_press(Message::BrowseTrackFile)].spacing(6)),
+        ];
         let recording = column![
-            labeled("", self.flag("Record a local encoded copy", "recording", "enabled")),
-            labeled(
-                "Folder",
-                row![self.field("recording", "folder"), action("Browse...").on_press(Message::BrowseFolder)].spacing(8),
-            ),
-            labeled("Status", text(self.recording_status.as_str())),
+            caption("LOCAL RECORDING"),
+            self.flag("Record a local encoded copy", "recording", "enabled"),
+            top("Folder", row![self.field("recording", "folder"), action("Browse...").on_press(Message::BrowseFolder)].spacing(6)),
         ];
+        let cards = [server, audio, station, track_info, recording].map(|rows| card(rows.spacing(8)));
 
-        let content = column![
-            header,
-            text(self.track.as_str()),
-            canvas(Bars(&self.spectrum)).width(Fill).height(72),
-            group("Devices", devices),
-            group("Volumes", volumes),
-            group("Server", server),
-            group("Track info", track_info),
-            group("Local recording", recording),
-            row![text(self.save_hint.as_str()).width(Fill), button("Save settings").padding(PADDING).on_press(Message::Save)].spacing(8).align_y(Center),
+        // Under the list, not in it: the save is in reach wherever the list is scrolled.
+        let hint = if self.save_hint.is_empty() && unsaved { "Unsaved changes" } else { self.save_hint.as_str() };
+        let bar = row![
+            text(hint).size(12).style(text::secondary).width(Fill),
+            action("Revert").on_press_maybe(unsaved.then_some(Message::Revert)),
+            button("Save").padding(PADDING).style(rounded(button::primary)).on_press_maybe(unsaved.then_some(Message::Save)),
         ]
-        .spacing(10)
-        .padding(12);
-        scrollable(content).into()
+        .spacing(6)
+        .align_y(Center);
+        column![scrollable(Column::from_iter(cards).spacing(GAP)).spacing(4).height(Fill), bar].spacing(GAP).into()
     }
 
     fn subscription(&self) -> Subscription<Message> {
@@ -773,27 +860,92 @@ fn picked(section: &'static str, key: &'static str, file: rfd::FileHandle) -> Me
     Message::Field(section, key, file.path().to_string_lossy().into_owned())
 }
 
+/// A status line as headline and reason: "Reconnecting... (reason)" and
+/// "Streaming stopped: reason" carry both.
+fn headline(status: &str) -> (&str, &str) {
+    match status.split_once(" (") {
+        Some((headline, reason)) => (headline, reason.strip_suffix(')').unwrap_or(reason)),
+        None => status.split_once(": ").unwrap_or((status, "")),
+    }
+}
+
+/// Hours, minutes and seconds on air.
+fn clock(seconds: u64) -> String {
+    format!("{}:{:02}:{:02}", seconds / 3600, seconds / 60 % 60, seconds % 60)
+}
+
+fn rounded(style: fn(&Theme, button::Status) -> button::Style) -> impl Fn(&Theme, button::Status) -> button::Style {
+    move |theme, status| {
+        let style = style(theme, status);
+        button::Style { border: style.border.rounded(RADIUS), ..style }
+    }
+}
+
+fn rounded_list(theme: &Theme, status: pick_list::Status) -> pick_list::Style {
+    let style = pick_list::default(theme, status);
+    pick_list::Style { border: style.border.rounded(RADIUS), ..style }
+}
+
+fn input<'a>(placeholder: &str, value: &str) -> iced::widget::TextInput<'a, Message> {
+    text_input(placeholder, value).padding(PADDING).style(|theme, status| {
+        let style = text_input::default(theme, status);
+        text_input::Style { border: style.border.rounded(RADIUS), ..style }
+    })
+}
+
 /// A button that is not the main action of the window.
 fn action(label: &str) -> iced::widget::Button<'_, Message> {
-    button(label).padding(PADDING).style(button::secondary)
+    button(label).padding(PADDING).style(rounded(button::secondary))
 }
 
-fn labeled<'a>(label: &'a str, control: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
-    row![text(label).width(190), control.into()].spacing(8).align_y(Center).into()
+/// A small button for the footer.
+fn link<'a>(label: String, color: Option<Color>) -> iced::widget::Button<'a, Message> {
+    button(text(label).size(12).color_maybe(color)).padding([3, 8]).style(rounded(button::secondary))
 }
 
-fn group<'a>(title: &'a str, rows: Column<'a, Message>) -> Element<'a, Message> {
-    column![text(title).size(12).style(text::secondary), container(rows.spacing(6)).padding(10).width(Fill).style(container::bordered_box)]
-        .spacing(4)
+fn tab<'a>(label: &'a str, page: Page, current: Page) -> iced::widget::Button<'a, Message> {
+    let style: fn(&Theme, button::Status) -> button::Style = if page == current { button::secondary } else { button::text };
+    button(label).padding([5, 14]).style(rounded(style)).on_press(Message::Page(page))
+}
+
+fn caption(label: &str) -> iced::widget::Text<'_> {
+    text(label).size(11).style(text::secondary)
+}
+
+/// A control with its label above it.
+fn top<'a>(label: &'a str, control: impl Into<Element<'a, Message>>) -> Column<'a, Message> {
+    column![text(label).size(12).style(text::secondary), control.into()].spacing(3).width(Fill)
+}
+
+fn card<'a>(content: impl Into<Element<'a, Message>>) -> Element<'a, Message> {
+    container(content)
+        .padding(12)
+        .width(Fill)
+        .style(|theme: &Theme| container::Style {
+            background: Some(theme.extended_palette().background.weakest.color.into()),
+            border: iced::border::rounded(8),
+            ..Default::default()
+        })
         .into()
 }
 
-/// A volume slider, or `unknown` while the server has not reported the volume.
-fn volume<'a>(percent: Option<u32>, unknown: &'a str, on_change: fn(u32) -> Message) -> Element<'a, Message> {
-    match percent {
-        Some(percent) => row![slider(0..=100, percent, on_change), text(format!("{percent}%")).width(44)].spacing(8).align_y(Center).into(),
-        None => text(unknown).into(),
-    }
+fn lamp_dot<'a>(color: Color) -> Element<'a, Message> {
+    container(space())
+        .width(12)
+        .height(12)
+        .style(move |_: &Theme| container::Style { background: Some(color.into()), border: iced::border::rounded(6), ..Default::default() })
+        .into()
+}
+
+/// A volume row. Its height does not change when the server reports the volume and
+/// the slider appears.
+fn level<'a>(label: &'a str, percent: Option<u32>, unknown: &'a str, on_change: fn(u32) -> Message) -> Element<'a, Message> {
+    let control: Element<'a, Message> = match percent {
+        Some(percent) => slider(0..=100, percent, on_change).into(),
+        None => space().width(Fill).into(),
+    };
+    let value = percent.map_or(unknown.to_string(), |percent| format!("{percent}%"));
+    row![text(label).width(LABEL), control, text(value).width(40).align_x(iced::Right)].spacing(8).height(22).align_y(Center).into()
 }
 
 fn backend_events() -> impl Stream<Item = Message> {
@@ -810,7 +962,6 @@ impl canvas::Program<Message> for Bars<'_> {
         let mut frame = canvas::Frame::new(renderer, bounds.size());
         let (width, height) = (bounds.width, bounds.height);
         let palette = theme.extended_palette();
-        frame.fill_rectangle(Point::ORIGIN, bounds.size(), palette.background.weak.color);
         let gradient = canvas::gradient::Linear::new(Point::new(0.0, height), Point::ORIGIN)
             .add_stop(0.0, GREEN)
             .add_stop(0.65, YELLOW)
@@ -1062,6 +1213,8 @@ mod tests {
             assert_eq!(config.get("recording", "enabled"), "true");
         }
         assert_eq!(app.save_hint, "Saved");
+        // The save normalizes the form too, so nothing counts as unsaved after it.
+        assert!(app.form == app.config);
         app.save_hint_until = Some(Instant::now());
         let _ = app.update(Message::Tick);
         assert_eq!(app.save_hint, "");
@@ -1114,6 +1267,31 @@ mod tests {
         app.volume_touched = Some(Instant::now() - Duration::from_millis(400));
         let _ = app.update(Message::Pw(pw::Event::StreamVolume(31)));
         assert_eq!(app.stream_volume, Some(31));
+    }
+
+    #[test]
+    fn u6_revert_drops_unsaved_edits() {
+        let mut app = app("u6");
+        assert!(app.form == app.config);
+        let _ = app.update(Message::Field("server", "genre", "Jazz".into()));
+        assert!(app.form != app.config);
+        let _ = app.update(Message::Revert);
+        assert!(app.form == app.config);
+        assert_eq!(app.form.get("server", "genre"), "Post-Avant Jazzcore");
+    }
+
+    #[test]
+    fn u7_status_headline_and_clock() {
+        assert_eq!(headline("LIVE"), ("LIVE", ""));
+        assert_eq!(headline("Reconnecting... (network connection failed)"), ("Reconnecting...", "network connection failed"));
+        // The reason can be a line of ffmpeg output with brackets and colons of its own.
+        assert_eq!(headline("Reconnecting... (Error (x): y)"), ("Reconnecting...", "Error (x): y"));
+        assert_eq!(headline("Streaming stopped: authentication failed"), ("Streaming stopped", "authentication failed"));
+        assert_eq!(headline("LIVE - poor connection!"), ("LIVE - poor connection!", ""));
+        assert_eq!(clock(0), "0:00:00");
+        assert_eq!(clock(59), "0:00:59");
+        assert_eq!(clock(3725), "1:02:05");
+        assert_eq!(clock(36000), "10:00:00");
     }
 
     #[test]

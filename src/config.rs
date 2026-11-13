@@ -62,6 +62,13 @@ pub struct Config {
     path: PathBuf,
 }
 
+impl PartialEq for Config {
+    /// The same values; the file path is not compared.
+    fn eq(&self, other: &Config) -> bool {
+        self.ini.iter().eq(other.ini.iter())
+    }
+}
+
 impl Config {
     /// Load `path`, overlaying any keys found in the file onto the defaults.
     /// A missing file yields defaults only; an unparsable file is an error.
