@@ -141,6 +141,7 @@ pub fn spawn(sink: &str, on_event: impl Fn(Event) + Send + 'static) -> Handle {
         config: None,
         want_live: false,
         connected: false,
+        connected_at: Instant::now(),
         restart_delay: FIRST_RETRY,
         retry_at: None,
         child: None,
@@ -154,6 +155,12 @@ pub fn spawn(sink: &str, on_event: impl Fn(Event) + Send + 'static) -> Handle {
 const FIRST_RETRY: Duration = Duration::from_secs(2);
 const LAST_RETRY: Duration = Duration::from_secs(30);
 const STALL_PERIOD: Duration = Duration::from_secs(1);
+/// A run that was connected this long had a working encoder, password and mount, so
+/// its end is a lost connection and is retried whatever ffmpeg printed. A refused
+/// password also counts as connected for a moment: ffmpeg sends audio without
+/// waiting for the server's answer (measured: under 0.5 s against a local Icecast
+/// and the ingest proxy). Raise this if a server takes longer to refuse.
+const STABLE_RUN: Duration = Duration::from_secs(10);
 
 struct Supervisor<F> {
     sink: String,
@@ -164,6 +171,8 @@ struct Supervisor<F> {
     config: Option<Box<Config>>,
     want_live: bool,
     connected: bool,
+    /// When `connected` last became true.
+    connected_at: Instant,
     restart_delay: Duration,
     retry_at: Option<Instant>,
     child: Option<Child>,
@@ -212,6 +221,9 @@ impl<F: Fn(Event)> Supervisor<F> {
     fn set_connected(&mut self, connected: bool) {
         if self.connected != connected {
             self.connected = connected;
+            if connected {
+                self.connected_at = Instant::now();
+            }
             (self.on_event)(Event::Connected(connected));
         }
     }
@@ -260,7 +272,7 @@ impl<F: Fn(Event)> Supervisor<F> {
                 self.child = Some(child);
                 self.started = Instant::now();
             }
-            Err(error) => self.schedule_retry(&format!("ffmpeg error: could not start: {error}")),
+            Err(error) => self.schedule_retry(&format!("ffmpeg error: could not start: {error}"), false),
         }
     }
 
@@ -282,6 +294,7 @@ impl<F: Fn(Event)> Supervisor<F> {
     fn exited(&mut self) {
         let Some(mut child) = self.child.take() else { return };
         let code = child.wait().ok().and_then(|status| status.code()).unwrap_or(-1);
+        let lost = self.connected && self.connected_at.elapsed() >= STABLE_RUN;
         self.set_connected(false);
         if !self.want_live {
             return;
@@ -294,15 +307,16 @@ impl<F: Fn(Event)> Supervisor<F> {
             "" => format!("ffmpeg exited (code {code})"),
             output => output.to_string(),
         };
-        self.schedule_retry(&reason);
+        self.schedule_retry(&reason, lost);
     }
 
-    fn schedule_retry(&mut self, reason: &str) {
+    /// `lost`: the run had been connected for `STABLE_RUN`.
+    fn schedule_retry(&mut self, reason: &str, lost: bool) {
         let Some(config) = &self.config else { return };
         if !self.want_live || self.retry_at.is_some() {
             return;
         }
-        let (summary, retry) = ffmpeg::classify_diagnostic(reason, &self.sink);
+        let (summary, retry) = if lost { ("connection lost", true) } else { ffmpeg::classify_diagnostic(reason, &self.sink) };
         let detail = ffmpeg::scrub_diagnostic(config, reason);
         self.set_connected(false);
         if !retry {
@@ -545,16 +559,25 @@ pub(crate) mod tests {
         };
         assert!(!detail.contains("wrong-pw"), "{detail}");
 
-        // The server dies mid-stream: a faithful quirk of the original - the broken
-        // pipe block names the mp3 encoder, so it is not retried automatically.
+        // The server dies before the run counts as stable: the broken pipe block names
+        // the mp3 encoder, as after a wrong password, so it is not retried.
         streamer.send(Command::GoLive(Box::new(config.clone())));
         wait_event(&events, 15, "connected", |e| *e == Event::Connected(true));
         wait_state(&events, 15, "LIVE", true, false, true);
         drop(icecast);
         wait_state(&events, 15, "Streaming stopped: ffmpeg encoder unavailable", false, true, false);
+
+        // The server dies under a stable run: retried until the server is back, with
+        // no new go-live.
         let icecast = start_icecast(&dir, PORT);
         streamer.send(Command::GoLive(Box::new(config.clone())));
-        wait_event(&events, 15, "reconnected", |e| *e == Event::Connected(true));
+        wait_event(&events, 15, "connected", |e| *e == Event::Connected(true));
+        std::thread::sleep(STABLE_RUN + Duration::from_secs(1));
+        drop(icecast);
+        wait_state(&events, 15, "Reconnecting... (connection lost)", false, true, true);
+        wait_state(&events, 15, "Reconnecting... (network connection failed)", false, true, true);
+        let icecast = start_icecast(&dir, PORT);
+        wait_event(&events, 40, "reconnected", |e| *e == Event::Connected(true));
         wait_for("mount is back", || icecast_status().contains("/main.mp3"));
 
         // Dropping the handle while live ends ffmpeg too.
@@ -606,15 +629,19 @@ pub(crate) mod tests {
         wait_state(&events, 15, "LIVE", true, false, true);
         wait_for("audio reaching the master", master_live);
 
-        // An upload stalled for 20 s is kicked by the proxy. Same quirk as an Icecast
-        // that dies: ffmpeg's broken pipe lines name the mp3 encoder, so no retry.
+        // An upload stalled for 20 s is kicked by the proxy. The run was stable, so the
+        // streamer connects again by itself.
         let pids = ffmpeg_pids();
         assert_eq!(pids.len(), 1);
         let signal = |name: &str| drop(std::process::Command::new("kill").args([name, &pids[0]]).status());
         signal("-STOP");
         std::thread::sleep(Duration::from_secs(21));
         signal("-CONT");
-        wait_state(&events, 15, "Streaming stopped: ffmpeg encoder unavailable", false, true, false);
+        wait_state(&events, 15, "Reconnecting... (connection lost)", false, true, true);
+        wait_state(&events, 15, "LIVE", true, false, true);
+        wait_for("audio reaching the master", master_live);
+        streamer.send(Command::Stop);
+        wait_state(&events, 15, "Off air", false, false, false);
         wait_for("master connection closed", || !master_live());
 
         // A wrong password: the proxy resets the connection, which is not retried.
