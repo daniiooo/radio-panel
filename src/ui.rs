@@ -299,7 +299,7 @@ impl App {
             return Task::none();
         }
         match message {
-            Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(460.0, 580.0), Size::new(400.0, 580.0)),
+            Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(460.0, 560.0), Size::new(400.0, 560.0)),
             Message::Page(page) => self.page = page,
             Message::Revert => self.form = self.config.clone(),
             Message::ToggleGraph => return toggle(&mut self.graph, "GRAPH", Size::new(680.0, 200.0), Size::new(600.0, 120.0)),
@@ -815,8 +815,8 @@ impl App {
         ];
         let recording = column![
             caption("LOCAL COPIES"),
-            self.flag("Record a local encoded copy", "recording", "enabled"),
-            self.flag("Save a tracklist (.txt)", "recording", "save_titles"),
+            self.flag("Record stream", "recording", "enabled"),
+            self.flag("Save tracklist", "recording", "save_titles"),
             top("Folder", row![self.field("recording", "folder"), action("Browse...").on_press(Message::BrowseFolder)].spacing(6)),
         ];
         let cards = [server, audio, station, track_info, recording].map(|rows| card(rows.spacing(8)));
