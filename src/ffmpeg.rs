@@ -392,8 +392,6 @@ mod tests {
                 "",
                 "-ice_genre",
                 "Post-Avant Jazzcore",
-                "-ice_description",
-                "Cave Explorer Committee",
                 url.as_str(),
             ]
         );

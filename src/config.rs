@@ -37,7 +37,7 @@ fn defaults() -> Ini {
         ("server", "source_password", "hackme"),
         ("server", "stream_name", ""),
         ("server", "genre", "Post-Avant Jazzcore"),
-        ("server", "description", "Cave Explorer Committee"),
+        ("server", "description", ""),
         ("server", "stream_url", ""),
         ("server", "public", "false"),
         ("server", "autoconnect", "false"),
