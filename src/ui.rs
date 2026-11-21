@@ -1289,14 +1289,14 @@ mod tests {
         }
         // Nothing takes effect before the save. The password is not trimmed by it; the
         // file format drops outer spaces at the next start, as it did for the Python app.
-        assert_eq!(app.config.get("server", "host"), "stream.example.com");
+        assert_eq!(app.config.get("server", "host"), "");
         let _ = app.update(Message::Save);
         assert_eq!(app.config.get("server", "source_password"), "p w ");
         let saved = Config::load(&config_file("u2")).unwrap();
         for config in [&app.config, &app.form, &saved] {
             assert_eq!(config.get("server", "host"), "127.0.0.1");
             assert_eq!(config.get("server", "user"), "source");
-            assert_eq!(config.get("server", "port"), "1337");
+            assert_eq!(config.get("server", "port"), "8000");
             assert_eq!(config.get("audio", "silence_warning_seconds"), "600");
             assert_eq!(config.get("recording", "enabled"), "true");
         }

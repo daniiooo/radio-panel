@@ -640,7 +640,7 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    /// Go-live as the station sees it: the real ingest proxy code in front of a fake master.
+    /// Go-live through the real ingest proxy code in front of a fake master.
     #[test]
     fn streams_to_ingest_proxy() {
         let _live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());

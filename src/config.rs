@@ -30,8 +30,8 @@ fn defaults() -> Ini {
     let folder = format!("{home}/Radio Recordings");
     let track_file = format!("{home}/now-playing.txt");
     let rows = [
-        ("server", "host", "stream.example.com"),
-        ("server", "port", "1337"),
+        ("server", "host", ""),
+        ("server", "port", "8000"),
         ("server", "mount", "main.mp3"),
         ("server", "user", "source"),
         ("server", "source_password", "hackme"),
@@ -189,7 +189,7 @@ mod tests {
         let dir = temp_dir("defaults");
         let path = dir.join("nonexistent.conf");
         let cfg = Config::load(&path).unwrap();
-        assert_eq!(cfg.get("server", "port"), "1337");
+        assert_eq!(cfg.get("server", "port"), "8000");
         assert_eq!(cfg.get("audio", "format"), "mp3");
         assert_eq!(cfg.get("server", "no_such_key"), "");
         let home = std::env::var("HOME").unwrap();
@@ -263,7 +263,7 @@ mod tests {
         assert_eq!(cfg.get("server", "stream_url"), "");
         assert_eq!(cfg.get("server", "host"), "127.0.0.1");
         assert_eq!(cfg.get("server", "source_password"), "a%b");
-        assert_eq!(cfg.get("server", "port"), "1337");
+        assert_eq!(cfg.get("server", "port"), "8000");
         cleanup(&dir);
     }
 

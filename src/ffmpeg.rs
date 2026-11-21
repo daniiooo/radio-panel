@@ -257,7 +257,7 @@ pub fn classify_diagnostic(detail: &str, sink: &str) -> (&'static str, bool) {
         ("authentication failed", false)
     } else if has_code(&d, "403") {
         // Icecast: no more sources or a format it refuses; a proxy in front of the
-        // server (Cloudflare refuses SOURCE and PUT). A wrong password is a 401.
+        // server (a CDN refuses SOURCE and PUT). A wrong password is a 401.
         ("refused by the server (403)", false)
     } else if d.contains("unknown encoder")
         || d.contains("error selecting an encoder")
