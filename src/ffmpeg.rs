@@ -250,12 +250,15 @@ pub fn classify_diagnostic(detail: &str, sink: &str) -> (&'static str, bool) {
     {
         ("mount already occupied", false)
     } else if has_code(&d, "401")
-        || has_code(&d, "403")
         || d.contains("unauthorized")
         || d.contains("authentication failed")
         || d.contains("access denied")
     {
         ("authentication failed", false)
+    } else if has_code(&d, "403") {
+        // Icecast: no more sources or a format it refuses; a proxy in front of the
+        // server (Cloudflare refuses SOURCE and PUT). A wrong password is a 401.
+        ("refused by the server (403)", false)
     } else if d.contains("unknown encoder")
         || d.contains("error selecting an encoder")
         || d.contains("libmp3lame")
@@ -512,6 +515,59 @@ mod tests {
         assert_eq!(final_diagnostic_line(&es), "é".repeat(240));
     }
 
+    /// ffmpeg itself must turn the escaped URL back into the real name and password
+    /// (it does since some version; a regression would only show as "wrong password").
+    #[test]
+    fn t9_ffmpeg_sends_the_real_credentials() {
+        use base64::Engine;
+        use std::io::Read;
+        for (user, password) in [("dj name", "p@ss/w:rd"), ("ハチ", "pä%ss#?&+ :x"), ("source", "dj|pw")] {
+            let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+            let port = listener.local_addr().unwrap().port().to_string();
+            let config = cfg(&[
+                ("server", "host", "127.0.0.1"),
+                ("server", "port", &port),
+                ("server", "user", user),
+                ("server", "source_password", password),
+            ]);
+            // The panel's own command, with a test tone in place of the sink.
+            let mut cmd = stream_command(&config, "unused");
+            let input = cmd.iter().position(|arg| arg == "pulse").unwrap();
+            cmd.splice(input..input + 2, ["lavfi".to_string(), "-i".into(), "anullsrc".into(), "-t".into(), "2".into()]);
+            cmd.retain(|arg| arg != "unused.monitor");
+            let mut child = std::process::Command::new(&cmd[0]).args(&cmd[1..]).stdout(std::process::Stdio::null()).spawn().unwrap();
+            // A URL ffmpeg misreads sends it elsewhere: fail instead of waiting forever.
+            listener.set_nonblocking(true).unwrap();
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(10);
+            let mut connection = loop {
+                match listener.accept() {
+                    Ok((connection, _)) => break connection,
+                    Err(_) if std::time::Instant::now() < deadline => std::thread::sleep(std::time::Duration::from_millis(20)),
+                    Err(_) => {
+                        let _ = child.kill();
+                        let _ = child.wait();
+                        panic!("ffmpeg never connected for {user:?}");
+                    }
+                }
+            };
+            connection.set_nonblocking(false).unwrap();
+            connection.set_read_timeout(Some(std::time::Duration::from_secs(5))).unwrap();
+            let mut head = Vec::new();
+            let mut buffer = [0; 4096];
+            while !head.windows(4).any(|w| w == b"\r\n\r\n") {
+                let n = connection.read(&mut buffer).unwrap();
+                assert!(n > 0, "ffmpeg closed before its headers");
+                head.extend_from_slice(&buffer[..n]);
+            }
+            let _ = child.kill();
+            let _ = child.wait();
+            let head = String::from_utf8_lossy(&head).into_owned();
+            let auth = head.lines().find_map(|line| line.strip_prefix("Authorization: Basic ")).unwrap();
+            let sent = base64::prelude::BASE64_STANDARD.decode(auth.trim()).unwrap();
+            assert_eq!(String::from_utf8(sent).unwrap(), format!("{user}:{password}"));
+        }
+    }
+
     #[test]
     fn t8_classify_diagnostic() {
         assert_eq!(
@@ -554,7 +610,8 @@ mod tests {
             classify_diagnostic("Connection to tcp://127.0.0.1:14031 failed: Connection refused", "radio-dev"),
             ("network connection failed", true)
         );
-        assert_eq!(classify_diagnostic("Server returned 403 Forbidden", "radio-dev"), ("authentication failed", false));
+        assert_eq!(classify_diagnostic("Server returned 403 Forbidden", "radio-dev"), ("refused by the server (403)", false));
+        assert_eq!(classify_diagnostic("Server returned 401 Unauthorized (authorization failed)", "radio-dev"), ("authentication failed", false));
         assert_eq!(classify_diagnostic("HTTP error 401", "radio-dev"), ("authentication failed", false));
     }
 }
