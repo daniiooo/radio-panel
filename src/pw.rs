@@ -144,8 +144,11 @@ fn watch_volume(node: &pw::node::Node, report: impl Fn(u32) + 'static) -> pw::no
 struct Loopback {
     context: pw::context::ContextRc,
     sink: String,
-    /// Target named in the module arguments; without one WirePlumber restores the saved target.
+    /// Target named in the module arguments: an output picked while the monitor was
+    /// off. Without one WirePlumber restores the saved target.
     output: Option<String>,
+    /// `output` still has to be written as a move, so that WirePlumber saves it.
+    save_output: bool,
     module: *mut pw::sys::pw_impl_module,
     node: Option<(u32, pw::node::Node, pw::node::NodeListener)>,
 }
@@ -159,6 +162,7 @@ impl Loopback {
         if !self.module.is_null() {
             return;
         }
+        self.save_output = self.output.is_some();
         let target = self.output.as_ref().map(|o| format!(" target.object=\"{o}\"")).unwrap_or_default();
         let args = format!(
             "{{ node.description=\"{sink}-local\" capture.props={{ node.name=\"input.{sink}-local\" target.object=\"{sink}\" stream.capture.sink=true node.passive=true }} playback.props={{ node.name=\"{playback}\"{target} }} }}",
@@ -382,6 +386,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
         context: context.clone(),
         sink: sink_name.to_string(),
         output: None,
+        save_output: false,
         module: std::ptr::null_mut(),
         node: None,
     }));
@@ -424,13 +429,33 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
             }
         }
     });
+    // A target in the loopback's own properties is not saved by WirePlumber. Write it
+    // as a move too, once WirePlumber has linked the loopback (it saves a move only
+    // for a node it knows); from then on WirePlumber remembers it.
+    let save_output: Rc<dyn Fn()> = Rc::new({
+        let (loopback, graph, metadata) = (loopback.clone(), graph.clone(), metadata.clone());
+        move || {
+            let mut loopback = loopback.borrow_mut();
+            let Some(node) = loopback.node.as_ref().map(|(id, ..)| *id).filter(|_| loopback.save_output) else { return };
+            let graph = graph.borrow();
+            if !graph.links.values().any(|link| link.out_node == node) {
+                return;
+            }
+            let serial = graph.sinks.values().find(|s| Some(&s.name) == loopback.output.as_ref()).map(|s| s.serial.clone());
+            if let (Some(serial), Some(metadata)) = (serial, &*metadata.borrow()) {
+                metadata.set_property(node, "target.object", Some("Spa:Id"), Some(&serial));
+                (loopback.save_output, loopback.output) = (false, None);
+            }
+        }
+    });
+
     let _registry_listener = registry
         .add_listener_local()
         .global({
             let (registry, loopback, on_event) = (registry.clone(), loopback.clone(), on_event.clone());
             let (graph, metadata, report) = (graph.clone(), metadata.clone(), report.clone());
             let scanning = scanning.clone();
-            let (saved, stream_proxies, adopt) = (saved.clone(), stream_proxies.clone(), adopt.clone());
+            let (saved, stream_proxies, adopt, save_output) = (saved.clone(), stream_proxies.clone(), adopt.clone(), save_output.clone());
             let sink_name = sink_name.to_string();
             move |global| {
                 let Some(props) = global.props else { return };
@@ -490,6 +515,7 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                     _ => return,
                 }
                 adopt();
+                save_output();
                 report();
             }
         })
@@ -558,8 +584,10 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                     (&loopback.node, &*metadata.borrow(), serial)
                 {
                     metadata.set_property(*node, "target.object", Some("Spa:Id"), Some(&serial));
+                } else {
+                    // The monitor is off: the pick applies when it is turned on.
+                    loopback.output = Some(output);
                 }
-                loopback.output = Some(output);
             }
             Command::Quit => mainloop.quit(),
         }
@@ -815,6 +843,21 @@ Output/Audio:application.name:other={"target":"radio2"}
         panel.send(Command::Monitor(false));
         wait_for("loopback stream gone", || !loopback_listed());
         assert!(sink_exists(SINK));
+
+        // An output picked while the monitor is off is used when it is turned on, and
+        // WirePlumber remembers it like a move.
+        let local_key = "Output/Audio:media.name:radio-dev-local output";
+        let saved_to = |sink: &str| streams_saved_to(&saved_streams_state(), sink).contains(local_key);
+        wait_for("first output remembered", || saved_to(OUT));
+        panel.send(Command::Output(OUT2.into()));
+        panel.send(Command::Monitor(true));
+        wait_for("monitor on the second dev output", playing_to(OUT2));
+        wait_for("second output remembered", || saved_to(OUT2));
+        panel.send(Command::Output(OUT.into()));
+        wait_for("monitor moved back", playing_to(OUT));
+        wait_for("first output remembered again", || saved_to(OUT));
+        panel.send(Command::Monitor(false));
+        wait_for("loopback stream gone", || !loopback_listed());
 
         // A player on the sink at quit: the panel makes no links of its own. WirePlumber
         // ignores this player (no autoconnect), so nothing links it anywhere.

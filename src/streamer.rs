@@ -13,7 +13,8 @@ use crate::ffmpeg;
 #[derive(Default)]
 pub struct Progress {
     linebuf: String,
-    /// Scrubbed log lines, last 2000 chars.
+    /// Log lines as ffmpeg wrote them, last 2000 chars. They can hold credentials:
+    /// classified as they are, scrubbed before they are shown.
     pub last_output: String,
     bytes: Option<u64>,
     time: f64,
@@ -28,7 +29,7 @@ pub enum ProgressEvent {
 }
 
 impl Progress {
-    pub fn feed(&mut self, chunk: &str, now: f64, scrub: impl Fn(&str) -> String) -> Vec<ProgressEvent> {
+    pub fn feed(&mut self, chunk: &str, now: f64) -> Vec<ProgressEvent> {
         self.linebuf.push_str(chunk);
         let mut events = Vec::new();
         while let Some(pos) = self.linebuf.find('\n') {
@@ -63,7 +64,7 @@ impl Progress {
                     events.push(ProgressEvent::Record);
                 }
             } else {
-                self.last_output.push_str(&scrub(line));
+                self.last_output.push_str(line);
                 self.last_output.push('\n');
                 let count = self.last_output.chars().count();
                 if count > 2000 {
@@ -277,9 +278,11 @@ impl<F: Fn(Event)> Supervisor<F> {
     }
 
     fn output(&mut self, chunk: &str) {
-        let (Some(config), Some(_)) = (&self.config, &self.child) else { return };
+        if self.child.is_none() {
+            return;
+        }
         let now = self.clock.elapsed().as_secs_f64();
-        for event in self.progress.feed(chunk, now, |line| ffmpeg::scrub_diagnostic(config, line)) {
+        for event in self.progress.feed(chunk, now) {
             match event {
                 ProgressEvent::Rate(kbps) => (self.on_event)(Event::Rate(kbps)),
                 ProgressEvent::Record if self.want_live && !self.connected => {
@@ -368,9 +371,6 @@ pub(crate) mod tests {
     use super::*;
     use crate::pw::tests::{pactl, wait_for};
 
-    fn id(s: &str) -> String {
-        s.to_string()
-    }
 
     pub(crate) const SINK: &str = "radio-dev-stream";
     pub(crate) const PORT: u16 = 18010;
@@ -682,14 +682,14 @@ pub(crate) mod tests {
     #[test]
     fn p1_partial_lines() {
         let mut p = Progress::default();
-        assert_eq!(p.feed("total_size=1000\ntotal_si", 0.0, id), vec![]);
-        assert_eq!(p.feed("ze=6000\n", 0.5, id), vec![ProgressEvent::Rate(80.0)]);
+        assert_eq!(p.feed("total_size=1000\ntotal_si", 0.0), vec![]);
+        assert_eq!(p.feed("ze=6000\n", 0.5), vec![ProgressEvent::Rate(80.0)]);
     }
 
     #[test]
     fn p2_blank_lines_skipped() {
         let mut p = Progress::default();
-        assert_eq!(p.feed("\n  \n\r\n", 0.0, id), vec![]);
+        assert_eq!(p.feed("\n  \n\r\n", 0.0), vec![]);
         assert_eq!(p.last_output, "");
     }
 
@@ -699,7 +699,6 @@ pub(crate) mod tests {
         let out = p.feed(
             "frame=  100\nsize=    1024kB time=00:00:04.20\n[pulse @ 0x1] latency=5 ms\nConnection refused\n",
             0.0,
-            id,
         );
         assert_eq!(out, vec![]);
         assert_eq!(
@@ -711,46 +710,57 @@ pub(crate) mod tests {
     #[test]
     fn p4_rate_samples() {
         let mut p = Progress::default();
-        assert_eq!(p.feed("total_size=1000\n", 1.0, id), vec![]);
-        assert_eq!(p.feed("total_size=6000\n", 1.5, id), vec![ProgressEvent::Rate(80.0)]);
-        assert_eq!(p.feed("total_size=1000\n", 2.0, id), vec![ProgressEvent::Rate(0.0)]);
-        assert_eq!(p.feed("total_size=9000\n", 2.0, id), vec![]);
-        assert_eq!(p.feed("total_size=N/A\n", 3.0, id), vec![]);
-        assert_eq!(p.feed("total_size=\n", 3.0, id), vec![]);
-        assert_eq!(p.feed("total_size=10000\n", 2.5, id), vec![ProgressEvent::Rate(16.0)]);
+        assert_eq!(p.feed("total_size=1000\n", 1.0), vec![]);
+        assert_eq!(p.feed("total_size=6000\n", 1.5), vec![ProgressEvent::Rate(80.0)]);
+        assert_eq!(p.feed("total_size=1000\n", 2.0), vec![ProgressEvent::Rate(0.0)]);
+        assert_eq!(p.feed("total_size=9000\n", 2.0), vec![]);
+        assert_eq!(p.feed("total_size=N/A\n", 3.0), vec![]);
+        assert_eq!(p.feed("total_size=\n", 3.0), vec![]);
+        assert_eq!(p.feed("total_size=10000\n", 2.5), vec![ProgressEvent::Rate(16.0)]);
     }
 
     #[test]
     fn p5_record() {
         let mut p = Progress::default();
-        assert_eq!(p.feed("progress=continue\n", 0.0, id), vec![ProgressEvent::Record]);
-        assert_eq!(p.feed("progress=end\n", 0.0, id), vec![ProgressEvent::Record]);
-        assert_eq!(p.feed("progress=whatever\n", 0.0, id), vec![]);
-        assert_eq!(p.feed("total_size=0\n", 1.0, id), vec![]);
+        assert_eq!(p.feed("progress=continue\n", 0.0), vec![ProgressEvent::Record]);
+        assert_eq!(p.feed("progress=end\n", 0.0), vec![ProgressEvent::Record]);
+        assert_eq!(p.feed("progress=whatever\n", 0.0), vec![]);
+        assert_eq!(p.feed("total_size=0\n", 1.0), vec![]);
         assert_eq!(
-            p.feed("total_size=5000\nprogress=continue\n", 1.5, id),
+            p.feed("total_size=5000\nprogress=continue\n", 1.5),
             vec![ProgressEvent::Rate(80.0), ProgressEvent::Record]
         );
     }
 
     #[test]
     fn p6_log_window() {
-        let scrub = |l: &str| l.replace("secret", "***");
         let mut p = Progress::default();
-        p.feed("pw secret\n", 0.0, scrub);
-        assert_eq!(p.last_output, "pw ***\n");
+        p.feed("pw secret\n", 0.0);
+        assert_eq!(p.last_output, "pw secret\n");
         let chunk = "ąąąąąąąąą\n".repeat(300);
-        p.feed(&chunk, 0.0, scrub);
+        p.feed(&chunk, 0.0);
         assert_eq!(p.last_output.chars().count(), 2000);
         assert!(p.last_output.ends_with("ą\n"));
         assert!(!p.last_output.contains("pw"));
+    }
+
+    /// A password that is also part of a word: the failure is still classified by
+    /// ffmpeg's words, and the shown detail does not carry the password.
+    #[test]
+    fn p8_classified_raw_shown_scrubbed() {
+        let mut config = Config::load(std::path::Path::new("/nonexistent/radio-panel-test.conf")).unwrap();
+        config.set("server", "source_password", "out");
+        let mut p = Progress::default();
+        p.feed("Connection timed out\n", 0.0);
+        assert_eq!(ffmpeg::classify_diagnostic(&p.last_output, SINK), ("network connection failed", true));
+        assert!(!ffmpeg::scrub_diagnostic(&config, &p.last_output).contains("out"));
     }
 
     #[test]
     fn p7_stalled() {
         let mut p = Progress::default();
         assert!(!p.stalled(100.0));
-        p.feed("total_size=1\n", 10.0, id);
+        p.feed("total_size=1\n", 10.0);
         assert!(!p.stalled(11.5));
         assert!(p.stalled(11.6));
     }

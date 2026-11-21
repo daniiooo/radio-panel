@@ -38,6 +38,8 @@ const HISTORY: usize = 300;
 const POOR: f64 = 0.92;
 const DROP: f64 = 0.78;
 /// How often deadlines and the silence warning are checked.
+/// The main window opens at this size; its height is the least without a scrollbar.
+const MAIN_SIZE: Size = Size::new(460.0, 560.0);
 const TICK: Duration = Duration::from_millis(500);
 /// Longest wait at quit for ffmpeg and the sink to end (the Python app's limit). Past
 /// it the process exits anyway; the server then removes the sink and ffmpeg gets
@@ -50,6 +52,8 @@ const PADDING: [u16; 2] = [5, 10];
 const RADIUS: f32 = 6.0;
 /// Space between the cards.
 const GAP: f32 = 8.0;
+/// Text size of the track title.
+const TITLE: f32 = 17.0;
 /// Width of the label column of the levels.
 const LABEL: f32 = 64.0;
 
@@ -95,6 +99,7 @@ pub enum Message {
     ToggleGraph,
     ToggleDetails,
     Closed(window::Id),
+    Resized(window::Id, Size),
     Quit,
     Tray(ksni::Handle<PanelTray>),
     NoTray,
@@ -144,6 +149,8 @@ struct App {
     graph: Option<window::Id>,
     details: Option<window::Id>,
     page: Page,
+    /// Width of the main window, for cutting the title.
+    main_width: f32,
 
     status: String,
     live: bool,
@@ -264,6 +271,7 @@ impl App {
             graph: None,
             details: None,
             page: Page::OnAir,
+            main_width: MAIN_SIZE.width,
             status: "Off air".into(),
             live: false,
             error: false,
@@ -299,7 +307,12 @@ impl App {
             return Task::none();
         }
         match message {
-            Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(460.0, 560.0), Size::new(400.0, 560.0)),
+            Message::ToggleMain => {
+                self.main_width = MAIN_SIZE.width;
+                return toggle(&mut self.main, "MAIN", MAIN_SIZE, Size::new(400.0, MAIN_SIZE.height));
+            }
+            Message::Resized(id, size) if self.main == Some(id) => self.main_width = size.width,
+            Message::Resized(..) => {}
             Message::Page(page) => self.page = page,
             Message::Revert => self.form = self.config.clone(),
             Message::ToggleGraph => return toggle(&mut self.graph, "GRAPH", Size::new(680.0, 200.0), Size::new(600.0, 120.0)),
@@ -724,10 +737,12 @@ impl App {
         .spacing(10)
         .align_y(Center);
 
+        // Two lines at most, in a box of that height: the window is sized for it.
         let title = match self.track.as_str() {
-            "-" => text("Nothing playing").size(17).style(text::secondary),
-            track => text(track).size(17),
+            "-" => text("Nothing playing").size(TITLE).style(text::secondary),
+            track => text(fit(track, self.main_width - 48.0, TITLE, 2.0)).size(TITLE),
         };
+        let title = container(title).height(TITLE * 2.0 * 1.3 + 1.0).clip(true);
         let source = if self.override_active { "Manual override active" } else { "Automatic title" };
         let now_playing = column![
             caption("NOW PLAYING"),
@@ -838,6 +853,7 @@ impl App {
             Subscription::run(backend_events),
             Subscription::run(tray),
             window::close_events().map(Message::Closed),
+            window::resize_events().map(|(id, size)| Message::Resized(id, size)),
             iced::time::every(TICK).map(|_| Message::Tick),
             iced::system::theme_changes().map(Message::SystemTheme),
             keyboard::listen().filter_map(|event| match event {
@@ -868,6 +884,24 @@ fn headline(status: &str) -> (&str, &str) {
         Some((headline, reason)) => (headline, reason.strip_suffix(')').unwrap_or(reason)),
         None => status.split_once(": ").unwrap_or((status, "")),
     }
+}
+
+/// `title`, cut with "…" to what fits in `lines` lines of `width` px at text size
+/// `size`. ponytail: estimated per character (capitals wider, wide CJK double), not measured;
+/// the clipping box hides a third line if the estimate is too generous. Measure with
+/// the renderer's paragraph if titles get cut much too early.
+fn fit(title: &str, width: f32, size: f32, lines: f32) -> String {
+    let wide = |c: char| matches!(c as u32, 0x1100..=0x115F | 0x2E80..=0xA4CF | 0xAC00..=0xD7A3 | 0xF900..=0xFAFF | 0xFE30..=0xFE4F | 0xFF00..=0xFF60 | 0xFFE0..=0xFFE6 | 0x20000..=0x3FFFD);
+    // Wrapping at word ends wastes part of each line; leave room for the "…" too.
+    let budget = width * lines * 0.92 - size;
+    let mut used = 0.0;
+    for (at, c) in title.char_indices() {
+        used += size * if wide(c) { 1.0 } else if c.is_uppercase() { 0.7 } else { 0.5 };
+        if used > budget {
+            return format!("{}…", title[..at].trim_end());
+        }
+    }
+    title.to_string()
 }
 
 /// Hours, minutes and seconds on air.
@@ -1297,6 +1331,21 @@ mod tests {
         assert_eq!(clock(59), "0:00:59");
         assert_eq!(clock(3725), "1:02:05");
         assert_eq!(clock(36000), "10:00:00");
+    }
+
+    #[test]
+    fn u8_title_cut_with_an_ellipsis() {
+        // 100 px, 2 lines, size 10: budget 174, latin 5 px a character, wide ones 10.
+        assert_eq!(fit("Short", 100.0, 10.0, 2.0), "Short");
+        let long = "x".repeat(34);
+        assert_eq!(fit(&long, 100.0, 10.0, 2.0), long);
+        assert_eq!(fit(&"x".repeat(35), 100.0, 10.0, 2.0), "x".repeat(34) + "…");
+        // Characters, not bytes; the space before the cut goes.
+        assert_eq!(fit(&"ą".repeat(40), 100.0, 10.0, 2.0), "ą".repeat(34) + "…");
+        assert_eq!(fit(&format!("{} {}", "a".repeat(33), "b".repeat(5)), 100.0, 10.0, 2.0), "a".repeat(33) + "…");
+        assert_eq!(fit(&"愛".repeat(20), 100.0, 10.0, 2.0), "愛".repeat(17) + "…");
+        // Capitals count 7 px: 24 fit in 174.
+        assert_eq!(fit(&"X".repeat(25), 100.0, 10.0, 2.0), "X".repeat(24) + "…");
     }
 
     #[test]

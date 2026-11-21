@@ -225,7 +225,16 @@ pub fn final_diagnostic_line(details: &str) -> String {
     }
 }
 
-/// (message, retry) for a diagnostic, first match wins.
+/// `code` as a number of its own, not inside a longer one such as a port.
+fn has_code(text: &str, code: &str) -> bool {
+    text.match_indices(code).any(|(at, _)| {
+        let digit = |c: Option<char>| c.is_some_and(|c| c.is_ascii_digit());
+        !digit(text[..at].chars().next_back()) && !digit(text[at + code.len()..].chars().next())
+    })
+}
+
+/// (message, retry) for a diagnostic, first match wins. Give it ffmpeg's own text, not
+/// the scrubbed one: a password inside a word would change the words matched here.
 pub fn classify_diagnostic(detail: &str, sink: &str) -> (&'static str, bool) {
     let d = detail.to_ascii_lowercase();
     let sink_mon = format!("{sink}.monitor").to_ascii_lowercase();
@@ -240,8 +249,8 @@ pub fn classify_diagnostic(detail: &str, sink: &str) -> (&'static str, bool) {
         || d.contains("409 conflict")
     {
         ("mount already occupied", false)
-    } else if d.contains("401")
-        || d.contains("403")
+    } else if has_code(&d, "401")
+        || has_code(&d, "403")
         || d.contains("unauthorized")
         || d.contains("authentication failed")
         || d.contains("access denied")
@@ -540,5 +549,12 @@ mod tests {
             classify_diagnostic("something else", "radio-dev"),
             ("stream process exited", true)
         );
+        // Codes count only as numbers of their own.
+        assert_eq!(
+            classify_diagnostic("Connection to tcp://127.0.0.1:14031 failed: Connection refused", "radio-dev"),
+            ("network connection failed", true)
+        );
+        assert_eq!(classify_diagnostic("Server returned 403 Forbidden", "radio-dev"), ("authentication failed", false));
+        assert_eq!(classify_diagnostic("HTTP error 401", "radio-dev"), ("authentication failed", false));
     }
 }
