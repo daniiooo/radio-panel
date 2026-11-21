@@ -2792,7 +2792,6 @@ dependencies = [
  "iced",
  "ksni",
  "libc",
- "libspa",
  "notify",
  "pipewire",
  "rfd",
