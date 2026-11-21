@@ -1367,9 +1367,9 @@ mod tests {
         assert!(app.form == app.config);
         // Typing the saved value back is not an unsaved change either.
         let _ = app.update(Message::Field("server", "genre", "Jazz".into()));
-        let _ = app.update(Message::Field("server", "genre", "Post-Avant Jazzcore".into()));
+        let _ = app.update(Message::Field("server", "genre", "".into()));
         assert!(app.form == app.config);
-        assert_eq!(app.form.get("server", "genre"), "Post-Avant Jazzcore");
+        assert_eq!(app.form.get("server", "genre"), "");
     }
 
     #[test]
@@ -1419,12 +1419,12 @@ mod tests {
         let _ = app.update(state("LIVE", true, true));
         let _ = app.update(Message::Save);
         let _ = app.update(Message::Revert);
-        assert_eq!((app.form.get("server", "genre"), app.config.get("server", "genre")), ("Jazz", "Post-Avant Jazzcore"));
+        assert_eq!((app.form.get("server", "genre"), app.config.get("server", "genre")), ("Jazz", ""));
         // A pending auto-connect locks too.
         let _ = app.update(state("Off air", false, false));
         app.autoconnect_at = Some(Instant::now() + Duration::from_secs(60));
         let _ = app.update(Message::Save);
-        assert_eq!(app.config.get("server", "genre"), "Post-Avant Jazzcore");
+        assert_eq!(app.config.get("server", "genre"), "");
         app.autoconnect_at = None;
         let _ = app.update(Message::Save);
         assert_eq!(app.config.get("server", "genre"), "Jazz");

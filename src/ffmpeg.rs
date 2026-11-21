@@ -388,10 +388,6 @@ mod tests {
                 "1",
                 "-f",
                 "mp3",
-                "-ice_name",
-                "",
-                "-ice_genre",
-                "Post-Avant Jazzcore",
                 url.as_str(),
             ]
         );
