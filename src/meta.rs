@@ -1,8 +1,10 @@
-//! The track title: read from a watched file or set by hand, and pushed to Icecast
+//! The track title: read from a watched file or a player (MPRIS), or set by hand, and pushed to Icecast
 //! as stream metadata. One thread; commands go in over a channel, events come out
 //! through a callback that runs on that thread.
 
 use std::path::Path;
+use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, channel};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -71,6 +73,8 @@ enum Msg {
     Command(Command),
     Quit,
     FileChanged,
+    /// A player's title changed; sent by the poller whose stop flag it carries.
+    PlayerTitle(Arc<AtomicBool>, Option<String>),
     Done { request: u64, title: String, generation: u64, outcome: Outcome },
 }
 
@@ -101,6 +105,7 @@ pub fn spawn(config: Box<Config>, on_event: impl Fn(Event) + Send + 'static) -> 
         tx: tx.clone(),
         config,
         watcher: None,
+        poller: None,
         enabled: false,
         automatic_title: None,
         manual_title: None,
@@ -125,6 +130,8 @@ const RETRY_DELAYS: [Duration; 4] =
 const DEBOUNCE: Duration = Duration::from_millis(300);
 /// Gives Icecast a moment to register the mount after the stream connected.
 const INITIAL_PUSH: Duration = Duration::from_secs(2);
+/// How often the player is asked for its title.
+const POLL: Duration = Duration::from_secs(1);
 /// The Python app had no limit; a request that hangs would block all later titles.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -133,6 +140,8 @@ struct Pusher<F> {
     tx: Sender<Msg>,
     config: Box<Config>,
     watcher: Option<notify::RecommendedWatcher>,
+    /// Stop flag of the thread polling the player, when titles come from one.
+    poller: Option<Arc<AtomicBool>>,
     enabled: bool,
     automatic_title: Option<String>,
     manual_title: Option<String>,
@@ -153,6 +162,38 @@ struct Pusher<F> {
     /// The sent-titles file of this connection, once a title was sent, and the last
     /// title written to it.
     titles: Option<(std::path::PathBuf, String)>,
+}
+
+/// Report the title of player `id` now and whenever it changes, until `stop` is set.
+/// ponytail: polls once per `POLL` instead of following PropertiesChanged signals, so
+/// a title arrives up to a second late; follow the signals if that is ever too slow.
+fn poll_player(id: String, stop: Arc<AtomicBool>, tx: Sender<Msg>) {
+    let mut connection = None;
+    let mut last: Option<Option<String>> = None;
+    while !stop.load(Ordering::Relaxed) {
+        let title = player_title(&mut connection, &id);
+        if last.as_ref() != Some(&title) {
+            if tx.send(Msg::PlayerTitle(stop.clone(), title.clone())).is_err() {
+                break;
+            }
+            last = Some(title);
+        }
+        std::thread::sleep(POLL);
+    }
+}
+
+fn player_title(connection: &mut Option<zbus::blocking::Connection>, id: &str) -> Option<String> {
+    if connection.is_none() {
+        *connection = zbus::blocking::Connection::session().ok();
+    }
+    match connection.as_ref().map(|connection| crate::mpris::current_title(connection, id)) {
+        Some(Ok(title)) => title,
+        // The bus went away: connect again on the next round.
+        Some(Err(_)) | None => {
+            *connection = None;
+            None
+        }
+    }
 }
 
 /// Whether `timer` is due; a due timer is cleared.
@@ -189,6 +230,12 @@ impl<F: Fn(Event)> Pusher<F> {
                     self.push_current(true);
                 }
                 Ok(Msg::FileChanged) => self.debounce_at = Some(Instant::now() + DEBOUNCE),
+                // A poller stopped since may still report once.
+                Ok(Msg::PlayerTitle(from, title)) => {
+                    if self.poller.as_ref().is_some_and(|current| Arc::ptr_eq(current, &from)) {
+                        self.set_automatic(title);
+                    }
+                }
                 Ok(Msg::Done { request, title, generation, outcome }) => self.done(request, title, generation, outcome),
                 Err(RecvTimeoutError::Timeout) => {}
                 Ok(Msg::Quit) | Err(RecvTimeoutError::Disconnected) => break,
@@ -203,6 +250,13 @@ impl<F: Fn(Event)> Pusher<F> {
             if take_due(&mut self.retry_at, now) && self.enabled {
                 self.push_current(true);
             }
+        }
+        self.stop_poller();
+    }
+
+    fn stop_poller(&mut self) {
+        if let Some(stop) = self.poller.take() {
+            stop.store(true, Ordering::Relaxed);
         }
     }
 
@@ -220,8 +274,18 @@ impl<F: Fn(Event)> Pusher<F> {
 
     /// Watch the track file and read it. The nearest existing parent directory is
     /// watched too: the file may not exist yet, and replacing it ends its own watch.
+    /// With a player configured, its poller reports the title instead.
     fn rewatch(&mut self) {
         self.watcher = None;
+        self.stop_poller();
+        let player = self.config.get("metadata", "player").trim();
+        if !player.is_empty() {
+            let stop = Arc::new(AtomicBool::new(false));
+            let (id, flag, tx) = (player.to_string(), stop.clone(), self.tx.clone());
+            std::thread::spawn(move || poll_player(id, flag, tx));
+            self.poller = Some(stop);
+            return;
+        }
         let path = std::path::absolute(self.config.get("metadata", "track_file")).unwrap_or_default();
         if let Some(dir) = watch_dir(&path) {
             let (tx, track) = (self.tx.clone(), path.clone());
@@ -241,7 +305,10 @@ impl<F: Fn(Event)> Pusher<F> {
                 self.watcher = Some(watcher);
             }
         }
-        let title = read_track(&path);
+        self.set_automatic(read_track(&path));
+    }
+
+    fn set_automatic(&mut self, title: Option<String>) {
         if title == self.automatic_title {
             self.publish_track();
             return;
@@ -629,6 +696,51 @@ mod tests {
     }
 
     /// The title reaches a local Icecast, and the ingest proxy's master.
+    #[test]
+    fn m6_titles_from_a_player() {
+        let d = temp_dir("m6");
+        let script = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, requests) = mock_server(script);
+        let track_file = d.join("track.txt");
+        std::fs::write(&track_file, "From the file\n").unwrap();
+        let mut config = Config::load(&d.join("none.conf")).unwrap();
+        for (section, key, value) in [
+            ("server", "host", "127.0.0.1"),
+            ("server", "port", port.to_string().as_str()),
+            ("metadata", "track_file", track_file.to_str().unwrap()),
+            ("metadata", "player", "m6-player"),
+        ] {
+            config.set(section, key, value);
+        }
+        let fake = |title: Option<&str>| drop(crate::mpris::tests::FAKE_PLAYERS.lock().unwrap().insert("m6-player".into(), title.map(str::to_string)));
+        fake(Some("ハチ - 砂の惑星"));
+        let (tx, events) = channel();
+        let pusher = spawn(Box::new(config.clone()), move |event| drop(tx.send(event)));
+        pusher.send(Command::SetEnabled(true));
+
+        // The player's title, not the file's, is shown and sent.
+        wait(&events, track("ハチ - 砂の惑星"));
+        wait(&events, status("Metadata OK"));
+        let (line, _) = requests.recv_timeout(Duration::from_secs(15)).unwrap();
+        assert!(line.contains("&song=%E3%83%8F%E3%83%81%20-%20%E7%A0%82%E3%81%AE%E6%83%91%E6%98%9F "), "{line}");
+
+        // A new track arrives within a poll; a stopped player has no title.
+        fake(Some("Next"));
+        wait(&events, track("Next"));
+        fake(None);
+        wait(&events, track("-"));
+
+        // Back to the file: its title, and the player is no longer followed.
+        config.set("metadata", "player", "");
+        pusher.send(Command::Configure(Box::new(config)));
+        wait(&events, track("From the file"));
+        fake(Some("Ignored"));
+        std::thread::sleep(POLL * 3);
+        let seen: Vec<Event> = events.try_iter().collect();
+        assert!(!seen.contains(&track("Ignored")), "{seen:?}");
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn m5_saves_sent_titles_line_by_line() {
         let d = temp_dir("m5");

@@ -49,6 +49,8 @@ fn defaults() -> Ini {
         ("recording", "save_titles", "false"),
         ("recording", "folder", folder.as_str()),
         ("metadata", "track_file", track_file.as_str()),
+        // An MPRIS player id; empty means the track file.
+        ("metadata", "player", ""),
     ];
     for (s, k, v) in rows {
         ini.with_section(Some(s)).set(k, v);

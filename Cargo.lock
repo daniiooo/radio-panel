@@ -2798,6 +2798,7 @@ dependencies = [
  "rust-ini",
  "rustfft",
  "ureq",
+ "zbus",
 ]
 
 [[package]]

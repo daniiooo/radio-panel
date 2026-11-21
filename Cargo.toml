@@ -14,3 +14,4 @@ rfd = "0.18"
 rust-ini = "0.21"
 rustfft = "6"
 ureq = { version = "3", default-features = false }
+zbus = { version = "5", default-features = false, features = ["blocking-api", "tokio"] }

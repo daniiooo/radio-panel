@@ -173,6 +173,8 @@ struct App {
     recording_status: String,
     save_hint: String,
     save_hint_until: Option<Instant>,
+    /// MPRIS players found when the Settings page was last opened.
+    players: Vec<String>,
 
     audio_ready: bool,
     stream_volume: Option<u32>,
@@ -291,6 +293,7 @@ impl App {
             recording_status: "Recording disabled".into(),
             save_hint: String::new(),
             save_hint_until: None,
+            players: Vec::new(),
             audio_ready: false,
             stream_volume: None,
             local_volume: None,
@@ -315,7 +318,12 @@ impl App {
             }
             Message::Resized(id, size) if self.main == Some(id) => self.main_width = size.width,
             Message::Resized(..) => {}
-            Message::Page(page) => self.page = page,
+            Message::Page(page) => {
+                if page == Page::Settings {
+                    self.players = crate::mpris::players();
+                }
+                self.page = page;
+            }
             Message::Revert => self.form = self.config.clone(),
             Message::ToggleGraph => return toggle(&mut self.graph, "GRAPH", Size::new(680.0, 200.0), Size::new(600.0, 120.0)),
             Message::ToggleDetails => return toggle(&mut self.details, "DETAILS", Size::new(640.0, 320.0), Size::new(320.0, 160.0)),
@@ -845,10 +853,24 @@ impl App {
             top("Stream URL", self.field("server", "stream_url")),
             self.flag("List in public directory", "server", "public"),
         ];
-        let track_info = column![
+        // A saved player that is not running stays selectable.
+        let player = self.form.get("metadata", "player");
+        let mut sources = vec![Choice { value: String::new(), label: "Track file".into() }];
+        sources.extend(self.players.iter().map(|id| Choice { value: id.clone(), label: id.clone() }));
+        if !player.is_empty() && !self.players.iter().any(|id| id == player) {
+            sources.push(Choice { value: player.to_string(), label: format!("{player} (not running)") });
+        }
+        let source = sources.iter().find(|choice| choice.value == player).cloned();
+        let mut track_info = column![
             caption("TRACK TITLE"),
-            top("File the player writes the title to", row![self.field("metadata", "track_file"), action("Browse...").on_press_maybe((!self.locked()).then_some(Message::BrowseTrackFile))].spacing(6)),
+            top("Titles from", self.choose(sources, source, |choice: Choice| Message::Field("metadata", "player", choice.value))),
         ];
+        if player.is_empty() {
+            track_info = track_info.push(top(
+                "File the player writes the title to",
+                row![self.field("metadata", "track_file"), action("Browse...").on_press_maybe((!self.locked()).then_some(Message::BrowseTrackFile))].spacing(6),
+            ));
+        }
         let recording = column![
             caption("LOCAL COPIES"),
             self.flag("Record stream", "recording", "enabled"),

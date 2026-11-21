@@ -1,6 +1,7 @@
 mod config;
 mod ffmpeg;
 mod meta;
+mod mpris;
 mod pw;
 mod recorder;
 mod spectrum;
