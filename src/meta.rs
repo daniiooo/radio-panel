@@ -15,6 +15,8 @@ use crate::ffmpeg::quote;
 
 pub fn read_track(path: &Path) -> Option<String> {
     let text = std::fs::read_to_string(path).ok()?;
+    // Some players start the file with a byte order mark; it is not whitespace.
+    let text = text.strip_prefix('\u{feff}').unwrap_or(&text);
     let first = text.split(['\n', '\r']).next().unwrap_or("").trim();
     if first.is_empty() {
         None
@@ -460,6 +462,10 @@ mod tests {
         std::fs::write(&f6, [0xffu8, 0xfe, b'\n']).unwrap();
         assert_eq!(read_track(&f6), None);
 
+        let f7 = d.join("t7.txt");
+        write(&f7, "\u{feff}ハチ - 砂の惑星\n");
+        assert_eq!(read_track(&f7), Some("ハチ - 砂の惑星".to_string()));
+
         assert_eq!(read_track(&d.join("nope.txt")), None);
         assert_eq!(read_track(Path::new("")), None);
         let _ = std::fs::remove_dir_all(&d);
@@ -707,7 +713,9 @@ mod tests {
         let d = temp_dir("m4");
         let sink = crate::pw::spawn(SINK, |_| {});
         wait_for("sink monitor visible to pulse", || pactl(&["list", "short", "sources"]).contains(&format!("{SINK}.monitor")));
-        std::fs::write(d.join("track.txt"), "Zażółć - Gęślą\n").unwrap();
+        // Japanese, full-width, an emoji, and what URLs and the ICY format treat specially.
+        const TITLE: &str = "ハチ - 砂の惑星 feat. 初音ミク (Don't 100% #1 ?a=b+c & ＡＢＣ 🎵) Zażółć";
+        std::fs::write(d.join("track.txt"), format!("{TITLE}\n")).unwrap();
         let mut config = Config::load(&d.join("none.conf")).unwrap();
         for (section, key, value) in [
             ("server", "host", "127.0.0.1"),
@@ -717,8 +725,10 @@ mod tests {
             config.set(section, key, value);
         }
         let (icecast_port, proxy_port) = (PORT.to_string(), PROXY_PORT.to_string());
-        let on_icecast: fn() -> bool = || icecast_status().contains("Zażółć - Gęślą");
-        let on_master: fn() -> bool = || http_get(MASTER_PORT, "/status").contains("song=Zażółć - Gęślą");
+        // Icecast: what a listener's player reads from the stream, not only the status page.
+        let on_icecast: fn() -> bool = || icecast_status().contains(TITLE) && icy_title("/main.mp3").as_deref() == Some(TITLE);
+        // ingest: what its own code forwarded to the master, decoded there.
+        let on_master: fn() -> bool = || http_get(MASTER_PORT, "/status").contains(&format!("song={TITLE}\n"));
         let servers = [(icecast_port.as_str(), "source", PASSWORD, on_icecast), (proxy_port.as_str(), "dj", DJ_PASSWORD, on_master)];
         let _icecast = start_icecast(&d, PORT);
         let _ingest = start_ingest(&d);

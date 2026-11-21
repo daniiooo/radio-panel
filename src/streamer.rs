@@ -398,6 +398,7 @@ pub(crate) mod tests {
             <authentication><source-password>{PASSWORD}</source-password>
             <admin-user>admin</admin-user><admin-password>{PASSWORD}</admin-password></authentication>
             <listen-socket><port>{port}</port><bind-address>127.0.0.1</bind-address></listen-socket>
+            <mount><mount-name>/main.mp3</mount-name><charset>UTF-8</charset></mount>
             <paths><basedir>/usr/share/icecast</basedir><logdir>{}</logdir>
             <webroot>/usr/share/icecast/web</webroot><adminroot>/usr/share/icecast/admin</adminroot></paths>
             <logging><accesslog>access.log</accesslog><errorlog>error.log</errorlog></logging></icecast>",
@@ -447,6 +448,37 @@ pub(crate) mod tests {
             let _ = stream.read_to_string(&mut body);
         }
         body
+    }
+
+    /// The `StreamTitle` a listener of `mount` on the Icecast at `PORT` gets in the
+    /// stream (ICY metadata), as the bytes Icecast sent, read as UTF-8.
+    pub(crate) fn icy_title(mount: &str) -> Option<String> {
+        use std::io::{BufRead, BufReader, Write};
+        let mut stream = std::net::TcpStream::connect(("127.0.0.1", PORT)).ok()?;
+        stream.set_read_timeout(Some(Duration::from_secs(5))).ok()?;
+        stream.write_all(format!("GET {mount} HTTP/1.0\r\nIcy-MetaData: 1\r\n\r\n").as_bytes()).ok()?;
+        let mut reader = BufReader::new(stream);
+        let mut metaint = None;
+        loop {
+            let mut line = String::new();
+            reader.read_line(&mut line).ok()?;
+            let line = line.trim_end().to_ascii_lowercase();
+            if line.is_empty() {
+                break;
+            }
+            if let Some(value) = line.strip_prefix("icy-metaint:") {
+                metaint = value.trim().parse::<usize>().ok();
+            }
+        }
+        let mut audio = vec![0; metaint?];
+        reader.read_exact(&mut audio).ok()?;
+        let mut length = [0u8];
+        reader.read_exact(&mut length).ok()?;
+        let mut block = vec![0; length[0] as usize * 16];
+        reader.read_exact(&mut block).ok()?;
+        let block = String::from_utf8(block).ok()?;
+        let start = block.find("StreamTitle='")? + "StreamTitle='".len();
+        Some(block[start..start + block[start..].find("';")?].to_string())
     }
 
     /// Mounts the Icecast on `PORT` lists.
