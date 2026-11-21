@@ -41,7 +41,7 @@ const DROP: f64 = 0.78;
 const TICK: Duration = Duration::from_millis(500);
 /// Longest wait at quit for ffmpeg and the sink to end (the Python app's limit). Past
 /// it the process exits anyway; the server then removes the sink and ffmpeg gets
-/// SIGTERM, but players on the sink get no fallback links.
+/// SIGTERM.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(7);
 
 /// Inner padding of buttons, lists and text fields.
