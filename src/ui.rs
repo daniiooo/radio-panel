@@ -299,7 +299,7 @@ impl App {
             return Task::none();
         }
         match message {
-            Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(460.0, 540.0), Size::new(400.0, 300.0)),
+            Message::ToggleMain => return toggle(&mut self.main, "MAIN", Size::new(460.0, 580.0), Size::new(400.0, 580.0)),
             Message::Page(page) => self.page = page,
             Message::Revert => self.form = self.config.clone(),
             Message::ToggleGraph => return toggle(&mut self.graph, "GRAPH", Size::new(680.0, 200.0), Size::new(600.0, 120.0)),
@@ -771,7 +771,7 @@ impl App {
         footer = footer.push(link(rate, self.net_poor.then_some(ORANGE)).on_press(Message::ToggleGraph));
 
         let content = column![card(header), card(now_playing), card(canvas(Bars(&self.spectrum)).width(Fill).height(56)), card(levels), footer].spacing(GAP);
-        scrollable(content).spacing(4).into()
+        content.into()
     }
 
     fn view_settings(&self, unsaved: bool) -> Element<'_, Message> {
@@ -816,7 +816,7 @@ impl App {
         let recording = column![
             caption("LOCAL COPIES"),
             self.flag("Record a local encoded copy", "recording", "enabled"),
-            self.flag("Save sent titles to a text file, one per line", "recording", "save_titles"),
+            self.flag("Save a tracklist (.txt)", "recording", "save_titles"),
             top("Folder", row![self.field("recording", "folder"), action("Browse...").on_press(Message::BrowseFolder)].spacing(6)),
         ];
         let cards = [server, audio, station, track_info, recording].map(|rows| card(rows.spacing(8)));
