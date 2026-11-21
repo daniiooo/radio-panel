@@ -307,6 +307,8 @@ impl App {
             return Task::none();
         }
         match message {
+            // Also covers a file dialog that was opened before going live.
+            Message::Field(..) | Message::Save | Message::Revert | Message::BrowseTrackFile | Message::BrowseFolder if self.locked() => {}
             Message::ToggleMain => {
                 self.main_width = MAIN_SIZE.width;
                 return toggle(&mut self.main, "MAIN", MAIN_SIZE, Size::new(400.0, MAIN_SIZE.height));
@@ -646,7 +648,6 @@ impl App {
         self.config = self.form.clone();
         self.save_hint = match self.config.save() {
             Err(error) => format!("Not saved: {error}"),
-            Ok(()) if self.want_live => "Saved - restart the stream to apply".into(),
             Ok(()) => "Saved".into(),
         };
         self.save_hint_until = Some(Instant::now() + Duration::from_secs(4));
@@ -679,12 +680,31 @@ impl App {
         }
     }
 
+    /// Settings cannot change while streaming or about to: the stream, the metadata and
+    /// the recording would each run with different ones.
+    fn locked(&self) -> bool {
+        self.want_live || self.autoconnect_at.is_some()
+    }
+
     fn field(&self, section: &'static str, key: &'static str) -> iced::widget::TextInput<'_, Message> {
-        input("", self.form.get(section, key)).on_input(move |value| Message::Field(section, key, value))
+        let edit = move |value| Message::Field(section, key, value);
+        input("", self.form.get(section, key)).on_input_maybe((!self.locked()).then_some(edit))
     }
 
     fn flag<'a>(&self, label: &'a str, section: &'static str, key: &'static str) -> iced::widget::Checkbox<'a, Message> {
-        checkbox(self.form.get(section, key) == "true").label(label).on_toggle(move |on| Message::Field(section, key, on.to_string()))
+        let toggle = move |on: bool| Message::Field(section, key, on.to_string());
+        checkbox(self.form.get(section, key) == "true").label(label).on_toggle_maybe((!self.locked()).then_some(toggle))
+    }
+
+    /// A drop-down list; a read-only field while locked (a list cannot be disabled).
+    fn choose<'a, T: ToString + Clone + PartialEq + 'a>(
+        &self, options: Vec<T>, current: Option<T>, on_select: impl Fn(T) -> Message + 'a,
+    ) -> Element<'a, Message> {
+        if self.locked() {
+            input("", &current.map(|value| value.to_string()).unwrap_or_default()).into()
+        } else {
+            pick_list(options, current, on_select).padding(PADDING).style(rounded_list).width(Fill).into()
+        }
     }
 
     /// Two pages in one window: what is used on air, and the settings, which are
@@ -800,7 +820,11 @@ impl App {
             pair(top("Host / IP", self.field("server", "host")), top("Port", self.field("server", "port")).width(90)),
             top("Mount", self.field("server", "mount")),
             pair(
-                top("Username", input("source", self.form.get("server", "user")).on_input(|value| Message::Field("server", "user", value))),
+                top(
+                    "Username",
+                    input("source", self.form.get("server", "user"))
+                        .on_input_maybe((!self.locked()).then_some(|value| Message::Field("server", "user", value))),
+                ),
                 top("Password", self.field("server", "source_password").secure(true)),
             ),
             self.flag("Connect automatically on startup", "server", "autoconnect"),
@@ -808,11 +832,8 @@ impl App {
         let audio = column![
             caption("AUDIO"),
             row![
-                top("Format", pick_list(formats, format, |choice: Choice| Message::Field("audio", "format", choice.value)).padding(PADDING).style(rounded_list).width(Fill)),
-                top(
-                    "Bitrate (kbps)",
-                    pick_list(BITRATES, bitrate, |bitrate: &str| Message::Field("audio", "bitrate", bitrate.to_string())).padding(PADDING).style(rounded_list).width(Fill),
-                ),
+                top("Format", self.choose(formats, format, |choice: Choice| Message::Field("audio", "format", choice.value))),
+                top("Bitrate (kbps)", self.choose(BITRATES.to_vec(), bitrate, |bitrate: &str| Message::Field("audio", "bitrate", bitrate.to_string()))),
             ]
             .spacing(8),
             row![text("Warn after"), self.field("audio", "silence_warning_seconds").width(60), text("seconds of silence (0 = never)")].spacing(8).align_y(Center),
@@ -826,22 +847,27 @@ impl App {
         ];
         let track_info = column![
             caption("TRACK TITLE"),
-            top("File the player writes the title to", row![self.field("metadata", "track_file"), action("Browse...").on_press(Message::BrowseTrackFile)].spacing(6)),
+            top("File the player writes the title to", row![self.field("metadata", "track_file"), action("Browse...").on_press_maybe((!self.locked()).then_some(Message::BrowseTrackFile))].spacing(6)),
         ];
         let recording = column![
             caption("LOCAL COPIES"),
             self.flag("Record stream", "recording", "enabled"),
             self.flag("Save tracklist", "recording", "save_titles"),
-            top("Folder", row![self.field("recording", "folder"), action("Browse...").on_press(Message::BrowseFolder)].spacing(6)),
+            top("Folder", row![self.field("recording", "folder"), action("Browse...").on_press_maybe((!self.locked()).then_some(Message::BrowseFolder))].spacing(6)),
         ];
         let cards = [server, audio, station, track_info, recording].map(|rows| card(rows.spacing(8)));
 
         // Under the list, not in it: the save is in reach wherever the list is scrolled.
-        let hint = if self.save_hint.is_empty() && unsaved { "Unsaved changes" } else { self.save_hint.as_str() };
+        let hint = match () {
+            _ if self.locked() => "Stop streaming to change settings",
+            _ if self.save_hint.is_empty() && unsaved => "Unsaved changes",
+            _ => self.save_hint.as_str(),
+        };
+        let can_save = unsaved && !self.locked();
         let bar = row![
             text(hint).size(12).style(text::secondary).width(Fill),
-            action("Revert").on_press_maybe(unsaved.then_some(Message::Revert)),
-            button("Save").padding(PADDING).style(rounded(button::primary)).on_press_maybe(unsaved.then_some(Message::Save)),
+            action("Revert").on_press_maybe(can_save.then_some(Message::Revert)),
+            button("Save").padding(PADDING).style(rounded(button::primary)).on_press_maybe(can_save.then_some(Message::Save)),
         ]
         .spacing(6)
         .align_y(Center);
@@ -1346,6 +1372,36 @@ mod tests {
         assert_eq!(fit(&"愛".repeat(20), 100.0, 10.0, 2.0), "愛".repeat(17) + "…");
         // Capitals count 7 px: 24 fit in 174.
         assert_eq!(fit(&"X".repeat(25), 100.0, 10.0, 2.0), "X".repeat(24) + "…");
+    }
+
+    #[test]
+    fn u9_settings_locked_while_streaming() {
+        let mut app = app("u9");
+        let edit = |app: &mut App| drop(app.update(Message::Field("server", "genre", "Jazz".into())));
+        // Live, and while reconnecting: no edits, no save, no revert.
+        let _ = app.update(state("LIVE", true, true));
+        edit(&mut app);
+        assert!(app.form == app.config);
+        let _ = app.update(state("Reconnecting... (network connection failed)", false, true));
+        edit(&mut app);
+        assert!(app.form == app.config);
+        // Off air: editable again; edits made before going live survive it unsaved.
+        let _ = app.update(state("Off air", false, false));
+        edit(&mut app);
+        assert_eq!(app.form.get("server", "genre"), "Jazz");
+        let _ = app.update(state("LIVE", true, true));
+        let _ = app.update(Message::Save);
+        let _ = app.update(Message::Revert);
+        assert_eq!((app.form.get("server", "genre"), app.config.get("server", "genre")), ("Jazz", "Post-Avant Jazzcore"));
+        // A pending auto-connect locks too.
+        let _ = app.update(state("Off air", false, false));
+        app.autoconnect_at = Some(Instant::now() + Duration::from_secs(60));
+        let _ = app.update(Message::Save);
+        assert_eq!(app.config.get("server", "genre"), "Post-Avant Jazzcore");
+        app.autoconnect_at = None;
+        let _ = app.update(Message::Save);
+        assert_eq!(app.config.get("server", "genre"), "Jazz");
+        let _ = std::fs::remove_file(config_file("u9"));
     }
 
     #[test]

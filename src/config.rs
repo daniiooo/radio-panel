@@ -125,7 +125,9 @@ impl Config {
         }
         let pid = std::process::id();
         let dir = path.parent().map(Path::to_path_buf).unwrap_or_default();
-        let temp = dir.join(format!(".radio-panel.conf.{pid}"));
+        // Named after the target too: two configs saved at once must not share it.
+        let name = path.file_name().unwrap_or_default().to_string_lossy();
+        let temp = dir.join(format!(".{name}.{pid}"));
 
         // Build an escaped copy for the file (in-memory holds the real text).
         let mut out = Ini::new();
