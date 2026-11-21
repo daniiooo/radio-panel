@@ -1277,6 +1277,10 @@ mod tests {
         assert!(app.form != app.config);
         let _ = app.update(Message::Revert);
         assert!(app.form == app.config);
+        // Typing the saved value back is not an unsaved change either.
+        let _ = app.update(Message::Field("server", "genre", "Jazz".into()));
+        let _ = app.update(Message::Field("server", "genre", "Post-Avant Jazzcore".into()));
+        assert!(app.form == app.config);
         assert_eq!(app.form.get("server", "genre"), "Post-Avant Jazzcore");
     }
 

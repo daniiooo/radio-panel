@@ -63,9 +63,15 @@ pub struct Config {
 }
 
 impl PartialEq for Config {
-    /// The same values; the file path is not compared.
+    /// The same values; the file path and the order of keys (`set` moves a key to
+    /// the end) are not compared.
     fn eq(&self, other: &Config) -> bool {
-        self.ini.iter().eq(other.ini.iter())
+        fn values(config: &Config) -> Vec<(Option<&str>, &str, &str)> {
+            let mut values: Vec<_> = config.ini.iter().flat_map(|(section, props)| props.iter().map(move |(key, value)| (section, key, value))).collect();
+            values.sort();
+            values
+        }
+        values(self) == values(other)
     }
 }
 
