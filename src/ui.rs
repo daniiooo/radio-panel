@@ -814,8 +814,9 @@ impl App {
             top("File the player writes the title to", row![self.field("metadata", "track_file"), action("Browse...").on_press(Message::BrowseTrackFile)].spacing(6)),
         ];
         let recording = column![
-            caption("LOCAL RECORDING"),
+            caption("LOCAL COPIES"),
             self.flag("Record a local encoded copy", "recording", "enabled"),
+            self.flag("Save sent titles to a text file, one per line", "recording", "save_titles"),
             top("Folder", row![self.field("recording", "folder"), action("Browse...").on_press(Message::BrowseFolder)].spacing(6)),
         ];
         let cards = [server, audio, station, track_info, recording].map(|rows| card(rows.spacing(8)));

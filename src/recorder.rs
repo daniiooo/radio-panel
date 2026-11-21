@@ -249,7 +249,7 @@ impl<F: Fn(String)> Supervisor<F> {
 
 /// `~` and `~/...` mean the home directory.
 /// ponytail: `~user` is not expanded; nothing writes such a path into the config.
-fn expand_user(path: &str) -> PathBuf {
+pub(crate) fn expand_user(path: &str) -> PathBuf {
     let home = std::env::var("HOME").unwrap_or_default();
     match path.strip_prefix('~') {
         Some("") => PathBuf::from(home),
@@ -259,7 +259,7 @@ fn expand_user(path: &str) -> PathBuf {
 }
 
 /// Local time as `YYYYmmdd-HHMMSS`.
-fn timestamp() -> String {
+pub(crate) fn timestamp() -> String {
     let mut tm: libc::tm = unsafe { std::mem::zeroed() };
     unsafe {
         let now = libc::time(std::ptr::null_mut());

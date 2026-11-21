@@ -112,6 +112,7 @@ pub fn spawn(config: Box<Config>, on_event: impl Fn(Event) + Send + 'static) -> 
         debounce_at: None,
         initial_at: None,
         retry_at: None,
+        titles: None,
     };
     Handle { tx, thread: Some(std::thread::spawn(move || pusher.run(rx))) }
 }
@@ -147,6 +148,9 @@ struct Pusher<F> {
     debounce_at: Option<Instant>,
     initial_at: Option<Instant>,
     retry_at: Option<Instant>,
+    /// The sent-titles file of this connection, once a title was sent, and the last
+    /// title written to it.
+    titles: Option<(std::path::PathBuf, String)>,
 }
 
 /// Whether `timer` is due; a due timer is cleared.
@@ -252,6 +256,8 @@ impl<F: Fn(Event)> Pusher<F> {
         }
         self.enabled = enabled;
         self.generation += 1;
+        // Each connection gets its own file, like the recording.
+        self.titles = None;
         self.initial_at = None;
         self.retry_at = None;
         self.pending = false;
@@ -347,6 +353,32 @@ impl<F: Fn(Event)> Pusher<F> {
         });
     }
 
+    /// Append a title the server accepted to this connection's titles file, if the
+    /// settings ask for one. A resend of the same title is not written again.
+    fn save_title(&mut self, title: &str) -> std::io::Result<()> {
+        use std::io::Write;
+        if self.config.get("recording", "save_titles") != "true" || self.titles.as_ref().is_some_and(|(_, last)| last == title) {
+            return Ok(());
+        }
+        let path = match self.titles.take() {
+            Some((path, _)) => path,
+            None => {
+                let folder = self.config.get("recording", "folder").trim();
+                if folder.is_empty() {
+                    return Err(std::io::Error::other("no folder configured"));
+                }
+                let folder = crate::recorder::expand_user(folder);
+                std::fs::create_dir_all(&folder)?;
+                let stream_name = self.config.get("server", "stream_name");
+                crate::recorder::segment_path(&folder, stream_name, &crate::recorder::timestamp(), "titles.txt")
+            }
+        };
+        let written = std::fs::File::options().append(true).create(true).open(&path).and_then(|mut file| writeln!(file, "{title}"));
+        // After a failure the next title tries again, in the same file.
+        self.titles = Some((path, if written.is_ok() { title.to_string() } else { String::new() }));
+        written
+    }
+
     fn done(&mut self, request: u64, title: String, generation: u64, outcome: Outcome) {
         if self.inflight != Some(request) {
             return;
@@ -356,9 +388,12 @@ impl<F: Fn(Event)> Pusher<F> {
         if current {
             match outcome {
                 Outcome::Sent => {
-                    self.last_pushed = Some(title);
                     self.retry_index = 0;
-                    self.status("Metadata OK");
+                    match self.save_title(&title) {
+                        Ok(()) => self.status("Metadata OK"),
+                        Err(error) => self.status(format!("Metadata OK; titles not saved: {error}")),
+                    }
+                    self.last_pushed = Some(title);
                 }
                 Outcome::Retry if self.retry_index < RETRY_DELAYS.len() => {
                     let delay = RETRY_DELAYS[self.retry_index];
@@ -588,6 +623,82 @@ mod tests {
     }
 
     /// The title reaches a local Icecast, and the ingest proxy's master.
+    #[test]
+    fn m5_saves_sent_titles_line_by_line() {
+        let d = temp_dir("m5");
+        let script = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
+        let (port, requests) = mock_server(script.clone());
+        let folder = d.join("rec");
+        let mut config = Config::load(&d.join("none.conf")).unwrap();
+        for (section, key, value) in [
+            ("server", "host", "127.0.0.1"),
+            ("server", "port", port.to_string().as_str()),
+            ("server", "stream_name", "My Show"),
+            ("metadata", "track_file", d.join("none.txt").to_str().unwrap()),
+            ("recording", "folder", folder.to_str().unwrap()),
+        ] {
+            config.set(section, key, value);
+        }
+        let files = || {
+            let mut files: Vec<_> = std::fs::read_dir(&folder).map(|dir| dir.map(|entry| entry.unwrap().path()).collect()).unwrap_or_default();
+            files.sort();
+            files.into_iter().map(|path| (path.file_name().unwrap().to_string_lossy().into_owned(), std::fs::read_to_string(&path).unwrap())).collect::<Vec<_>>()
+        };
+        let (tx, events) = channel();
+        let pusher = spawn(Box::new(config.clone()), move |event| drop(tx.send(event)));
+        let send = |title: &str| {
+            pusher.send(Command::SetManualTitle(title.into()));
+            wait(&events, track(title));
+        };
+        pusher.send(Command::SetEnabled(true));
+        wait(&events, status("Waiting for stream"));
+
+        // Off by default: a sent title writes nothing.
+        send("Zero");
+        wait(&events, status("Metadata OK"));
+        assert!(files().is_empty());
+
+        // On: only titles the server took, each once, in the order sent.
+        config.set("recording", "save_titles", "true");
+        pusher.send(Command::Configure(Box::new(config.clone())));
+        send("Artist - Tytuł");
+        wait(&events, status("Metadata OK"));
+        pusher.send(Command::SendNow);
+        wait(&events, status("Sending metadata"));
+        wait(&events, status("Metadata OK"));
+        script.lock().unwrap().push(404);
+        send("Refused");
+        wait(&events, status("Metadata failed"));
+        send("Second");
+        wait(&events, status("Metadata OK"));
+        let first = files();
+        assert_eq!(first.len(), 1);
+        assert!(first[0].0.starts_with("My_Show-") && first[0].0.ends_with(".titles.txt"), "{}", first[0].0);
+        assert_eq!(first[0].1, "Artist - Tytuł\nSecond\n");
+
+        // A new connection starts a new file.
+        pusher.send(Command::SetEnabled(false));
+        pusher.send(Command::SetEnabled(true));
+        wait(&events, status("Metadata OK"));
+        let both = files();
+        assert_eq!(both.len(), 2, "{both:?}");
+        assert!(both.contains(&first[0]));
+        assert!(both.iter().any(|(_, text)| text == "Second\n"));
+
+        // No folder at the next connection: the title is still sent, the status says
+        // why it was not saved. A running connection keeps its file.
+        config.set("recording", "folder", " ");
+        pusher.send(Command::Configure(Box::new(config)));
+        send("Third");
+        wait(&events, status("Metadata OK"));
+        pusher.send(Command::SetEnabled(false));
+        pusher.send(Command::SetEnabled(true));
+        wait(&events, status("Metadata OK; titles not saved: no folder configured"));
+        drop(pusher);
+        while requests.try_recv().is_ok() {}
+        let _ = std::fs::remove_dir_all(&d);
+    }
+
     #[test]
     fn m4_metadata_reaches_icecast_and_ingest() {
         use crate::pw::tests::{pactl, wait_for};

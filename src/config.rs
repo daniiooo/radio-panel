@@ -46,6 +46,7 @@ fn defaults() -> Ini {
         ("audio", "monitor_enabled", "true"),
         ("audio", "silence_warning_seconds", "15"),
         ("recording", "enabled", "false"),
+        ("recording", "save_titles", "false"),
         ("recording", "folder", folder.as_str()),
         ("metadata", "track_file", track_file.as_str()),
     ];
