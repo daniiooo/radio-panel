@@ -508,8 +508,14 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
         let sink_name = sink_name.to_string();
         move || {
             let mut graph = graph.borrow_mut();
-            let serial = graph.sinks.values().find(|s| s.name == sink_name && !s.serial.is_empty()).map(|s| s.serial.clone());
-            if let (Some(serial), Some((metadata, _))) = (serial, &*metadata.borrow()) {
+            let sink = graph.sinks.iter().find(|(_, s)| s.name == sink_name && !s.serial.is_empty());
+            let serial = sink.map(|(id, s)| (*id, s.serial.clone()));
+            // WirePlumber saves a target by looking the serial up among the nodes it
+            // knows; a sink it has not seen yet is saved as no target, which wipes the
+            // route set up in pavucontrol. It links our spectrum capture to the sink
+            // once it knows it, so wait for a link out of the sink.
+            let known = serial.as_ref().is_some_and(|(id, _)| graph.links.values().any(|link| link.out_node == *id));
+            if let (true, Some((_, serial)), Some((metadata, _))) = (known, serial, &*metadata.borrow()) {
                 for node in graph.adopt.drain(..) {
                     metadata.set_property(node, "target.object", Some("Spa:Id"), Some(&serial));
                 }
@@ -1069,7 +1075,13 @@ Output/Audio:application.name:other={"target":"radio2"}
 
         // The next start takes the player back and removes the fallback links. The player
         // is also saved to our sink, as if routed there in pavucontrol: it gets our sink
-        // as its target. WirePlumber does not act on that for a player without autoconnect.
+        // as its target. WirePlumber does not act on that for a player without autoconnect,
+        // but it saves it. Start from no saved target in WirePlumber's own file.
+        let key = "Output/Audio:application.name:radio-dev-player";
+        let saved_by_wireplumber = || streams_saved_to(&saved_streams_state(), SINK).contains(key);
+        let (player_id, _) = node_ids("radio-dev-player").expect("player node");
+        let _ = std::process::Command::new("pw-metadata").args(["-n", "default", "--", &player_id, "target.object", "-1", "Spa:Id"]).output();
+        wait_for("no saved target", || !saved_by_wireplumber());
         let state = r#"Output/Audio:application.name:radio-dev-player={"target":"radio-dev"}"#;
         *SAVED_STATE.lock().unwrap() = Some(state.into());
         let (panel, events) = spawn_with_events(SINK);
@@ -1082,6 +1094,9 @@ Output/Audio:application.name:other={"target":"radio2"}
             String::from_utf8_lossy(&out.stdout).contains(&format!("id:{player} key:'target.object' value:'{sink}'"))
         });
         assert_eq!((links_of(left), links_of(right)), on(SINK));
+        // WirePlumber saved our sink as the player's target. Written before WirePlumber
+        // knew the new sink, it saved none: the route was gone from then on.
+        wait_for("target saved by WirePlumber", saved_by_wireplumber);
         drop(player);
 
         // Dropping the handle ends the thread and the server removes the sink.
