@@ -348,6 +348,7 @@ fn spawn_ffmpeg(args: &[String], run: u64, tx: Sender<Msg>) -> std::io::Result<C
     let mut command = std::process::Command::new(&args[0]);
     command.args(&args[1..]).stdin(Stdio::null()).stdout(writer.try_clone()?).stderr(writer);
     ffmpeg::die_with_parent(&mut command);
+    ffmpeg::no_fallback(&mut command);
     let child = command.spawn()?;
     drop(command); // closes our copies of the pipe's write end, so the reader sees its end
     std::thread::spawn(move || {
@@ -583,12 +584,26 @@ pub(crate) mod tests {
         // Dropping the handle while live ends ffmpeg too.
         streamer.send(Command::Stop);
         wait_state(&events, 15, "Off air", false, false, false);
-        streamer.send(Command::GoLive(Box::new(config)));
+        streamer.send(Command::GoLive(Box::new(config.clone())));
         wait_event(&events, 15, "connected", |e| *e == Event::Connected(true));
         drop(streamer);
         assert!(ffmpeg_pids().is_empty());
 
+        // The sink goes away while live: ffmpeg ends instead of capturing the default
+        // sink's monitor, and without the sink no attempt gets on air again.
+        let (tx, events) = channel();
+        let streamer = spawn(SINK, move |event| drop(tx.send(event)));
+        streamer.send(Command::GoLive(Box::new(config)));
+        wait_event(&events, 15, "connected", |e| *e == Event::Connected(true));
         drop(sink);
+        wait_event(&events, 15, "disconnected", |e| *e == Event::Connected(false));
+        let until = Instant::now() + Duration::from_secs(6);
+        while let Ok(event) = events.recv_timeout(until.saturating_duration_since(Instant::now())) {
+            assert_ne!(event, Event::Connected(true), "on air without the sink");
+        }
+        drop(streamer);
+        assert!(ffmpeg_pids().is_empty());
+
         drop(icecast);
         let _ = std::fs::remove_dir_all(&dir);
     }

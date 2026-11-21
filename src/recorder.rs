@@ -10,7 +10,7 @@ use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
 
 use crate::config::Config;
-use crate::ffmpeg::{audio_encoding, die_with_parent, safe_filename_component, terminate};
+use crate::ffmpeg::{audio_encoding, die_with_parent, no_fallback, safe_filename_component, terminate};
 
 pub const CUE_HEADER: &str = "# Radio Panel track cues (seconds from segment start)\n";
 
@@ -102,7 +102,7 @@ impl Drop for Handle {
 pub fn spawn(sink: &str, on_status: impl Fn(String) + Send + 'static) -> Handle {
     let (tx, rx) = channel();
     let supervisor =
-        Supervisor { sink: sink.to_string(), on_status, config: None, want: false, retry_at: None, child: None, cue: None, last_cue_title: String::new() };
+        Supervisor { sink: sink.to_string(), on_status, config: None, want: false, retry_at: None, child: None, cue: None, segment: None, last_cue_title: String::new() };
     Handle { tx, thread: Some(std::thread::spawn(move || supervisor.run(rx))) }
 }
 
@@ -118,6 +118,8 @@ struct Supervisor<F> {
     child: Option<Child>,
     /// The open cue file and the start of its segment.
     cue: Option<(File, Instant)>,
+    /// The audio file of the running segment.
+    segment: Option<PathBuf>,
     last_cue_title: String,
 }
 
@@ -187,12 +189,14 @@ impl<F: Fn(String)> Supervisor<F> {
             let mut ffmpeg = std::process::Command::new(&args[0]);
             ffmpeg.args(&args[1..]).stdin(Stdio::null()).stdout(Stdio::null()).stderr(Stdio::null());
             die_with_parent(&mut ffmpeg);
+            no_fallback(&mut ffmpeg);
             Ok((ffmpeg.spawn()?, cue, path))
         })();
         match started {
             Ok((child, cue, path)) => {
                 self.child = Some(child);
                 self.cue = Some((cue, Instant::now()));
+                self.segment = Some(path.clone());
                 self.last_cue_title.clear();
                 self.status(format!("Recording: {}", path.file_name().unwrap_or_default().to_string_lossy()));
             }
@@ -221,9 +225,17 @@ impl<F: Fn(String)> Supervisor<F> {
         }
     }
 
+    /// A segment without audio (ffmpeg failed at once) leaves no files: a failure
+    /// that lasts would otherwise add a cue file at every retry.
     fn close_cue(&mut self) {
         if let Some((cue, _)) = self.cue.take() {
             let _ = cue.sync_all();
+        }
+        if let Some(segment) = self.segment.take()
+            && !std::fs::metadata(&segment).is_ok_and(|file| file.len() > 0)
+        {
+            let _ = std::fs::remove_file(&segment);
+            let _ = std::fs::remove_file(segment.with_extension("cue"));
         }
     }
 
@@ -443,12 +455,30 @@ mod tests {
         assert_eq!(next(), "Recording stopped");
 
         // Dropping the handle while recording ends ffmpeg too.
-        recorder.send(Command::Start(Box::new(config)));
+        recorder.send(Command::Start(Box::new(config.clone())));
         assert!(next().starts_with("Recording: My_Show-"));
         drop(recorder);
         assert!(ffmpeg_pids().is_empty());
 
         drop(sink);
+
+        // Without the sink ffmpeg fails at once instead of recording another source,
+        // and the failed segments leave no files behind.
+        let missing = dir.join("missing");
+        config.set("recording", "folder", missing.to_str().unwrap());
+        let (tx, statuses) = channel();
+        let recorder = spawn("radio-dev-missing", move |status| drop(tx.send(status)));
+        recorder.send(Command::Start(Box::new(config)));
+        let mut seen = Vec::new();
+        while let Ok(status) = statuses.recv_timeout(Duration::from_secs(5)) {
+            seen.push(status);
+            if seen.iter().filter(|status| *status == "Recording failed; retrying").count() == 2 {
+                break;
+            }
+        }
+        drop(recorder);
+        assert_eq!(seen.iter().filter(|status| *status == "Recording failed; retrying").count(), 2, "{seen:?}");
+        assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
 }
