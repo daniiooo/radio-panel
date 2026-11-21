@@ -771,7 +771,12 @@ impl App {
             track => text(fit(track, self.main_width - 48.0, TITLE, 2.0)).size(TITLE),
         };
         let title = container(title).height(TITLE * 2.0 * 1.3 + 1.0).clip(true);
-        let source = if self.override_active { "Manual override active" } else { "Automatic title" };
+        let source = if self.override_active { "Manual tags" } else { "Automatic tags" };
+        // Off air nothing is sent, so there is no sending status worth showing.
+        let source = match self.metadata_status.as_str() {
+            "Disabled" => source.to_string(),
+            status => format!("{source}  \u{2022}  {status}"),
+        };
         let now_playing = column![
             caption("NOW PLAYING"),
             title,
@@ -781,7 +786,7 @@ impl App {
                 action("Automatic").on_press_maybe(self.override_active.then_some(Message::ReturnToAutomatic)),
             ]
             .spacing(6),
-            text(format!("{source}  \u{2022}  {}", self.metadata_status)).size(12).style(text::secondary),
+            text(source).size(12).style(text::secondary),
         ]
         .spacing(6);
 
