@@ -1,6 +1,8 @@
 //! The windows, the tray, and the glue between them and the backend threads.
 
 use std::collections::VecDeque;
+use std::os::unix::net::{UnixListener, UnixStream};
+use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
 use std::time::{Duration, Instant};
 
@@ -96,6 +98,8 @@ pub enum Message {
     Page(Page),
     Revert,
     ToggleMain,
+    /// Another start of the panel asked for the window.
+    Show,
     ToggleGraph,
     ToggleDetails,
     Closed(window::Id),
@@ -202,14 +206,59 @@ fn forward<E: 'static>(tx: &mpsc::UnboundedSender<Message>, wrap: fn(E) -> Messa
     move |event| drop(tx.unbounded_send(wrap(event)))
 }
 
+enum Instance {
+    /// This is the panel for the sink; a later start connects here.
+    First(UnixListener),
+    /// Another panel holds the sink and was asked to show its window.
+    Running,
+}
+
+/// One panel per sink: the first start holds a lock in `dir` (the kernel drops it
+/// with the process, also on a crash) and listens on a socket beside it.
+fn claim(dir: &Path, sink: &str) -> std::io::Result<Instance> {
+    let lock = std::fs::File::create(dir.join(format!("radio-panel-{sink}.lock")))?;
+    let socket = dir.join(format!("radio-panel-{sink}.sock"));
+    match lock.try_lock() {
+        Ok(()) => {}
+        Err(std::fs::TryLockError::WouldBlock) => {
+            let _ = UnixStream::connect(&socket);
+            return Ok(Instance::Running);
+        }
+        Err(std::fs::TryLockError::Error(error)) => return Err(error),
+    }
+    std::mem::forget(lock); // held until the process ends
+    // A crashed panel leaves its socket behind.
+    let _ = std::fs::remove_file(&socket);
+    Ok(Instance::First(UnixListener::bind(&socket)?))
+}
+
 fn boot() -> (App, Task<Message>) {
+    let sink = pw::sink_name();
+    let dir = std::env::var_os("XDG_RUNTIME_DIR").filter(|dir| !dir.is_empty()).map_or_else(std::env::temp_dir, PathBuf::from);
+    let listener = match claim(&dir, &sink) {
+        Ok(Instance::First(listener)) => Some(listener),
+        Ok(Instance::Running) => std::process::exit(0),
+        Err(error) => {
+            eprintln!("radio-panel: no single-instance lock: {error}");
+            None
+        }
+    };
     let config = Config::load(&config_path()).unwrap_or_else(|error| {
         eprintln!("radio-panel: {error}");
         std::process::exit(1);
     });
     let (tx, rx) = mpsc::unbounded();
     *EVENTS.lock().unwrap() = Some(rx);
-    let sink = pw::sink_name();
+    if let Some(listener) = listener {
+        let tx = tx.clone();
+        std::thread::spawn(move || {
+            for _ in listener.incoming() {
+                if tx.unbounded_send(Message::Show).is_err() {
+                    break;
+                }
+            }
+        });
+    }
     let samples = tx.clone();
     let backend = Backend {
         streamer: streamer::spawn(&sink, forward(&tx, Message::Stream)),
@@ -315,6 +364,12 @@ impl App {
             Message::ToggleMain => {
                 self.main_width = MAIN_SIZE.width;
                 return toggle(&mut self.main, "MAIN", MAIN_SIZE, Size::new(400.0, MAIN_SIZE.height));
+            }
+            Message::Show => {
+                return match self.main {
+                    Some(id) => window::gain_focus(id),
+                    None => self.update(Message::ToggleMain),
+                };
             }
             Message::Resized(id, size) if self.main == Some(id) => self.main_width = size.width,
             Message::Resized(..) => {}
@@ -1429,6 +1484,31 @@ mod tests {
         let _ = app.update(Message::Save);
         assert_eq!(app.config.get("server", "genre"), "Jazz");
         let _ = std::fs::remove_file(config_file("u9"));
+    }
+
+    #[test]
+    fn u10_a_second_start_shows_the_first_panel() {
+        let dir = std::env::temp_dir().join(format!("radio-panel-rs-ui-u10-{}", std::process::id()));
+        let _ = std::fs::remove_dir_all(&dir);
+        std::fs::create_dir_all(&dir).unwrap();
+        // A socket left by a crashed panel does not stop the next one.
+        std::fs::write(dir.join("radio-panel-radio-dev.sock"), "").unwrap();
+        let Ok(Instance::First(first)) = claim(&dir, "radio-dev") else { panic!("first start") };
+        assert!(matches!(claim(&dir, "radio-dev"), Ok(Instance::Running)));
+        // The second start connected: the first one is asked to show its window.
+        first.set_nonblocking(true).unwrap();
+        assert!(first.accept().is_ok());
+        // A panel on another sink is a panel of its own.
+        assert!(matches!(claim(&dir, "radio-dev-other"), Ok(Instance::First(_))));
+        let _ = std::fs::remove_dir_all(&dir);
+
+        // Show opens a hidden window and leaves an open one open.
+        let mut app = app("u10");
+        let _ = app.update(Message::Show);
+        let shown = app.main;
+        assert!(shown.is_some());
+        let _ = app.update(Message::Show);
+        assert_eq!(app.main, shown);
     }
 
     #[test]
