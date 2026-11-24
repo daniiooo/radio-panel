@@ -481,4 +481,42 @@ mod tests {
         assert_eq!(std::fs::read_dir(&missing).unwrap().count(), 0);
         let _ = std::fs::remove_dir_all(&dir);
     }
+
+    /// A refused password is on air for a moment, so the recording starts; ffmpeg is
+    /// stopped before it writes anything, so no file of that moment stays behind.
+    #[test]
+    fn a_refused_go_live_leaves_no_recording() {
+        use crate::pw::tests::{pactl, wait_for};
+        use crate::streamer::tests::{LIVE, PORT, SINK, start_icecast, wait_event};
+        use crate::streamer::{Command as Stream, Event};
+        let _live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = temp_dir("refused");
+        let folder = dir.join("rec");
+        let sink = crate::pw::spawn(SINK, |_| {});
+        wait_for("sink monitor visible to pulse", || pactl(&["list", "short", "sources"]).contains(&format!("{SINK}.monitor")));
+        let icecast = start_icecast(&dir, PORT);
+        let config = cfg(&[
+            ("server", "host", "127.0.0.1"),
+            ("server", "port", &PORT.to_string()),
+            ("server", "source_password", "wrong-pw"),
+            ("recording", "enabled", "true"),
+            ("recording", "folder", folder.to_str().unwrap()),
+        ]);
+        let (tx, events) = channel();
+        let streamer = crate::streamer::spawn(SINK, move |event| drop(tx.send(event)));
+        let (tx, statuses) = channel();
+        let recorder = spawn(SINK, move |status| drop(tx.send(status)));
+        streamer.send(Stream::GoLive(Box::new(config.clone())));
+        // What the UI does with the connected state.
+        wait_event(&events, 15, "connected", |event| *event == Event::Connected(true));
+        recorder.send(Command::Start(Box::new(config)));
+        wait_event(&statuses, 15, "a segment", |status| status.starts_with("Recording: "));
+        wait_event(&events, 15, "disconnected", |event| *event == Event::Connected(false));
+        recorder.send(Command::Stop);
+        wait_event(&statuses, 15, "recording stopped", |status| status == "Recording stopped");
+        let seen: Vec<String> = std::fs::read_dir(&folder).map(|dir| dir.map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned()).collect()).unwrap_or_default();
+        assert!(seen.is_empty(), "{seen:?}");
+        drop((recorder, streamer, icecast, sink));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
