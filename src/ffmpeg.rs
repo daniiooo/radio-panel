@@ -259,6 +259,11 @@ pub fn classify_diagnostic(detail: &str, sink: &str) -> (&'static str, bool) {
         // Icecast: no more sources or a format it refuses; a proxy in front of the
         // server (a CDN refuses SOURCE and PUT). A wrong password is a 401.
         ("refused by the server (403)", false)
+    } else if d.contains("broken pipe") || d.contains("connection reset by peer") {
+        // ffmpeg sends audio without reading the server's answer, so a refused password
+        // or mount shows only as the server hanging up: Icecast closes (broken pipe),
+        // ingest resets. Runs that were on air for `STABLE_RUN` never get here.
+        ("server closed the connection; check password and mount", false)
     } else if d.contains("unknown encoder")
         || d.contains("error selecting an encoder")
         || d.contains("libmp3lame")
@@ -607,5 +612,14 @@ mod tests {
         assert_eq!(classify_diagnostic("Server returned 403 Forbidden", "radio-dev"), ("refused by the server (403)", false));
         assert_eq!(classify_diagnostic("Server returned 401 Unauthorized (authorization failed)", "radio-dev"), ("authentication failed", false));
         assert_eq!(classify_diagnostic("HTTP error 401", "radio-dev"), ("authentication failed", false));
+        // A wrong password, as ffmpeg 9.1 printed it: Icecast with Opus or Vorbis (no
+        // encoder named), ingest with Opus. Each stops, as it does with MP3.
+        let closed = ("server closed the connection; check password and mount", false);
+        let icecast_ogg = "[out#0/ogg @ 0x1] Could not write header (incorrect codec parameters ?): Broken pipe\n[af#0:0 @ 0x2] Error sending frames to consumers: Broken pipe\n[out#0/ogg @ 0x1] Nothing was written into output file, because at least one of its streams received no packets.";
+        assert_eq!(classify_diagnostic(icecast_ogg, "radio-dev"), closed);
+        let ingest_opus = "[aost#0:0/libopus @ 0x1] Error submitting a packet to the muxer: Connection reset by peer\n[out#0/ogg @ 0x2] Error closing file: Connection reset by peer";
+        assert_eq!(classify_diagnostic(ingest_opus, "radio-dev"), closed);
+        let icecast_mp3 = "[aost#0:0/libmp3lame @ 0x1] Error submitting a packet to the muxer: Broken pipe\n[out#0/mp3 @ 0x2] Error closing file: Broken pipe";
+        assert_eq!(classify_diagnostic(icecast_mp3, "radio-dev"), closed);
     }
 }

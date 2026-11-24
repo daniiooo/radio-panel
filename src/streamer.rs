@@ -583,22 +583,28 @@ pub(crate) mod tests {
         wait_state(&events, 15, "Off air", false, false, false);
         assert!(ffmpeg_pids().is_empty());
         wait_for("mount is gone", || !icecast_status().contains("/main.mp3"));
+        const CLOSED: &str = "Streaming stopped: server closed the connection; check password and mount";
+        let mut wrong_opus = wrongpw.clone();
         streamer.send(Command::GoLive(Box::new(wrongpw)));
         wait_event(&events, 15, "disconnected", |e| *e == Event::Connected(false));
-        wait_state(&events, 15, "Streaming stopped: ffmpeg encoder unavailable", false, true, false);
+        wait_state(&events, 15, CLOSED, false, true, false);
         let Event::Diagnostic(detail) = wait_event(&events, 15, "failure details", |e| matches!(e, Event::Diagnostic(d) if !d.is_empty()))
         else {
             unreachable!()
         };
         assert!(!detail.contains("wrong-pw"), "{detail}");
+        // The same with Opus, whose failure names no encoder: it stops too.
+        wrong_opus.set("audio", "format", "opus");
+        streamer.send(Command::GoLive(Box::new(wrong_opus)));
+        wait_state(&events, 15, CLOSED, false, true, false);
 
-        // The server dies before the run counts as stable: the broken pipe block names
-        // the mp3 encoder, as after a wrong password, so it is not retried.
+        // The server dies before the run counts as stable: a broken pipe, as after a
+        // wrong password, so it is not retried.
         streamer.send(Command::GoLive(Box::new(config.clone())));
         wait_event(&events, 15, "connected", |e| *e == Event::Connected(true));
         wait_state(&events, 15, "LIVE", true, false, true);
         drop(icecast);
-        wait_state(&events, 15, "Streaming stopped: ffmpeg encoder unavailable", false, true, false);
+        wait_state(&events, 15, CLOSED, false, true, false);
 
         // The server dies under a stable run: retried until the server is back, with
         // no new go-live.
@@ -692,11 +698,11 @@ pub(crate) mod tests {
         wait_for("master connection closed", || !master_live());
 
         // A wrong password: the proxy resets the connection, which is not retried.
-        // ffmpeg does not read the 401, so the same encoder message is all there is.
+        // ffmpeg does not read the 401; the reset is all there is.
         let mut wrongpw = config.clone();
         wrongpw.set("server", "source_password", "wrong-pw");
         streamer.send(Command::GoLive(Box::new(wrongpw)));
-        wait_state(&events, 15, "Streaming stopped: ffmpeg encoder unavailable", false, true, false);
+        wait_state(&events, 15, "Streaming stopped: server closed the connection; check password and mount", false, true, false);
         let Event::Diagnostic(detail) = wait_event(&events, 15, "failure details", |e| matches!(e, Event::Diagnostic(d) if !d.is_empty()))
         else {
             unreachable!()
