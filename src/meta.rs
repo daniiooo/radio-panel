@@ -286,7 +286,8 @@ impl<F: Fn(Event)> Pusher<F> {
             self.poller = Some(stop);
             return;
         }
-        let path = std::path::absolute(self.config.get("metadata", "track_file")).unwrap_or_default();
+        // `~` as in the recording folder.
+        let path = std::path::absolute(crate::recorder::expand_user(self.config.get("metadata", "track_file"))).unwrap_or_default();
         if let Some(dir) = watch_dir(&path) {
             let (tx, track) = (self.tx.clone(), path.clone());
             let watcher = notify::recommended_watcher(move |event: notify::Result<notify::Event>| {
