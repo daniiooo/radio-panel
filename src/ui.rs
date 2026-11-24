@@ -183,6 +183,10 @@ struct App {
     players: Vec<String>,
 
     audio_ready: bool,
+    /// The PipeWire connection was lost; its status line stands until the sink is back.
+    audio_lost: bool,
+    /// Auto-connect is for the start of the panel, not for a sink that came back.
+    autoconnect_tried: bool,
     stream_volume: Option<u32>,
     local_volume: Option<u32>,
     /// Last volume change made here; the server's echoes of a drag are ignored briefly.
@@ -366,6 +370,8 @@ impl App {
             save_hint_until: None,
             players: Vec::new(),
             audio_ready: false,
+            audio_lost: false,
+            autoconnect_tried: false,
             stream_volume: None,
             local_volume: None,
             volume_touched: None,
@@ -599,9 +605,12 @@ impl App {
                 if self.setting_is("audio", "monitor_enabled", "true") {
                     self.audio(pw::Command::Monitor(true));
                 }
-                if self.should_autoconnect() {
+                if self.should_autoconnect() && !std::mem::replace(&mut self.autoconnect_tried, true) {
                     self.autoconnect_at = Some(Instant::now() + Duration::from_millis(1500));
                     return self.set_status("Auto-connect pending...".into(), false, false);
+                }
+                if std::mem::take(&mut self.audio_lost) && !self.want_live {
+                    return self.set_status("Off air".into(), false, false);
                 }
             }
             pw::Event::StreamVolume(percent) if !echo_of_drag => self.stream_volume = Some(percent),
@@ -621,6 +630,7 @@ impl App {
             }
             pw::Event::Failed(error) => {
                 self.audio_ready = false;
+                self.audio_lost = true;
                 (self.stream_volume, self.local_volume) = (None, None);
                 return self.set_status(format!("Audio failed: {error}"), false, true);
             }
@@ -1549,6 +1559,28 @@ mod tests {
         assert!(shown.is_some());
         let _ = app.update(Message::Show);
         assert_eq!(app.main, shown);
+    }
+
+    #[test]
+    fn u11_audio_back_after_pipewire_restarts() {
+        let mut app = app("u11");
+        app.config.set("server", "autoconnect", "true");
+        app.config.set("server", "host", "127.0.0.1");
+        let _ = app.update(Message::Pw(pw::Event::Ready));
+        assert!(app.autoconnect_at.take().is_some());
+        // PipeWire restarts: the failure shows until the sink is back, then off air.
+        let _ = app.update(Message::Pw(pw::Event::Failed("connection error".into())));
+        assert_eq!((app.status.as_str(), app.audio_ready), ("Audio failed: connection error", false));
+        let _ = app.update(Message::Pw(pw::Event::Ready));
+        assert_eq!((app.status.as_str(), app.error, app.audio_ready), ("Off air", false, true));
+        // Auto-connect was for the start: a sink that came back does not go live.
+        assert!(app.autoconnect_at.is_none());
+        // While live the streamer's own status stands.
+        let _ = app.update(state("LIVE", true, true));
+        let _ = app.update(Message::Pw(pw::Event::Failed("connection error".into())));
+        let _ = app.update(state("Reconnecting... (connection lost)", false, true));
+        let _ = app.update(Message::Pw(pw::Event::Ready));
+        assert_eq!(app.status, "Reconnecting... (connection lost)");
     }
 
     #[test]

@@ -8,6 +8,7 @@ use std::ffi::CString;
 use std::io::Cursor;
 use std::rc::Rc;
 use std::thread::JoinHandle;
+use std::time::Duration;
 
 use pipewire as pw;
 use pw::spa;
@@ -37,7 +38,8 @@ pub enum Event {
     Outputs { sinks: Vec<(String, String)>, current: Option<String> },
     /// Sink monitor audio for the spectrum: mono, `CAPTURE_RATE`, -1.0..=1.0.
     Samples(Vec<f32>),
-    /// The connection could not be set up or was lost. The thread has ended.
+    /// The connection could not be set up or was lost (PipeWire restarted). It is
+    /// tried again every `RECONNECT`; `Ready` follows once the sink is back.
     Failed(String),
 }
 
@@ -66,6 +68,8 @@ impl Drop for Handle {
 
 /// Sample rate of `Event::Samples`.
 pub const CAPTURE_RATE: u32 = 44100;
+/// Wait between attempts to connect again after the connection was lost.
+const RECONNECT: Duration = Duration::from_secs(2);
 
 /// Sink node name: `RADIO_PANEL_SINK` for dev runs, else `radio`.
 pub fn sink_name() -> String {
@@ -92,11 +96,52 @@ pub fn spawn(sink: &str, on_event: impl Fn(Event) + Send + 'static) -> Handle {
     let sink = sink.to_string();
     let thread = std::thread::spawn(move || {
         let on_event = Rc::new(on_event);
-        if let Err(error) = run(&sink, rx, on_event.clone()) {
-            on_event(Event::Failed(error.to_string()));
+        let mut rx = Some(rx);
+        // One `Failed` per outage: attempts that fail to connect are not reported.
+        let mut reported = false;
+        loop {
+            match run(&sink, &mut rx, on_event.clone()) {
+                Ok(true) => break,
+                // Lost; reported by the core's error handler.
+                Ok(false) => reported = true,
+                Err(error) => {
+                    if !reported {
+                        on_event(Event::Failed(error.to_string()));
+                    }
+                    reported = true;
+                }
+            }
+            if wait(&mut rx, RECONNECT) {
+                break;
+            }
         }
     });
     Handle { tx, thread: Some(thread) }
+}
+
+/// Wait `delay` before the next attempt to connect; true if told to quit meanwhile.
+/// Other commands are dropped: there is nothing to apply them to, and the UI sends
+/// what it needs again at `Ready`.
+fn wait(rx: &mut Option<pw::channel::Receiver<Command>>, delay: Duration) -> bool {
+    let (Some(receiver), Ok(mainloop)) = (rx.take(), pw::main_loop::MainLoopRc::new(None)) else { return true };
+    let quit = Rc::new(Cell::new(false));
+    let commands = receiver.attach(mainloop.loop_(), {
+        let (mainloop, quit) = (mainloop.clone(), quit.clone());
+        move |command| {
+            if matches!(command, Command::Quit) {
+                quit.set(true);
+                mainloop.quit();
+            }
+        }
+    });
+    let timer = mainloop.loop_().add_timer({
+        let mainloop = mainloop.clone();
+        move |_| mainloop.quit()
+    });
+    let _ = timer.update_timer(Some(delay), None);
+    mainloop.run();
+    *rx = Some(commands.deattach());
+    quit.get()
 }
 
 fn set_volume(node: &pw::node::Node, percent: u32) {
@@ -357,7 +402,9 @@ fn capture<'c>(
     Ok((stream, listener))
 }
 
-fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(Event)>) -> Result<(), pw::Error> {
+/// One connection, until Quit (`Ok(true)`) or until it is lost (`Ok(false)`). `rx` is
+/// handed back for the next connection.
+fn run(sink_name: &str, rx: &mut Option<pw::channel::Receiver<Command>>, on_event: Rc<dyn Fn(Event)>) -> Result<bool, pw::Error> {
     pw::init();
     let mainloop = pw::main_loop::MainLoopRc::new(None)?;
     let context = pw::context::ContextRc::new(&mainloop, None)?;
@@ -563,8 +610,10 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
         })
         .register();
 
-    let _commands = rx.attach(mainloop.loop_(), {
-        let (mainloop, loopback) = (mainloop.clone(), loopback.clone());
+    let quit = Rc::new(Cell::new(false));
+    let Some(receiver) = rx.take() else { return Ok(true) };
+    let commands = receiver.attach(mainloop.loop_(), {
+        let (mainloop, loopback, quit) = (mainloop.clone(), loopback.clone(), quit.clone());
         let (graph, metadata) = (graph.clone(), metadata.clone());
         move |command| match command {
             Command::StreamVolume(percent) => set_volume(&sink, percent),
@@ -589,13 +638,17 @@ fn run(sink_name: &str, rx: pw::channel::Receiver<Command>, on_event: Rc<dyn Fn(
                     loopback.output = Some(output);
                 }
             }
-            Command::Quit => mainloop.quit(),
+            Command::Quit => {
+                quit.set(true);
+                mainloop.quit();
+            }
         }
     });
 
     mainloop.run();
+    *rx = Some(commands.deattach());
     loopback.borrow_mut().unload();
-    Ok(())
+    Ok(quit.get())
 }
 
 #[cfg(test)]
