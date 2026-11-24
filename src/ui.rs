@@ -1,6 +1,8 @@
 //! The windows, the tray, and the glue between them and the backend threads.
 
 use std::collections::VecDeque;
+use std::io::{Read, Write};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::os::unix::net::{UnixListener, UnixStream};
 use std::path::{Path, PathBuf};
 use std::sync::{LazyLock, Mutex};
@@ -213,16 +215,32 @@ enum Instance {
     Running,
 }
 
+/// Set at Quit: a panel that is quitting does not answer a new start.
+static QUITTING: AtomicBool = AtomicBool::new(false);
+
 /// One panel per sink: the first start holds a lock in `dir` (the kernel drops it
-/// with the process, also on a crash) and listens on a socket beside it.
+/// with the process, also on a crash) and listens on a socket beside it. A panel
+/// that answers there shows its window; one that is quitting hangs up, and this start
+/// waits for it to end (at most `QUIT_TIMEOUT`) and takes over.
 fn claim(dir: &Path, sink: &str) -> std::io::Result<Instance> {
-    let lock = std::fs::File::create(dir.join(format!("radio-panel-{sink}.lock")))?;
+    // Not truncated: in a shared temporary directory the name could be a symlink.
+    let lock = std::fs::OpenOptions::new().create(true).write(true).truncate(false).open(dir.join(format!("radio-panel-{sink}.lock")))?;
     let socket = dir.join(format!("radio-panel-{sink}.sock"));
     match lock.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
-            let _ = UnixStream::connect(&socket);
-            return Ok(Instance::Running);
+            let mut answer = [0];
+            let answered = UnixStream::connect(&socket).and_then(|mut stream| {
+                stream.set_read_timeout(Some(Duration::from_secs(2)))?;
+                stream.read(&mut answer)
+            });
+            match answered {
+                Ok(1) => return Ok(Instance::Running),
+                Ok(_) => lock.lock()?,
+                // It ended just now, or it does not answer.
+                Err(_) if lock.try_lock().is_ok() => {}
+                Err(_) => return Ok(Instance::Running),
+            }
         }
         Err(std::fs::TryLockError::Error(error)) => return Err(error),
     }
@@ -230,6 +248,16 @@ fn claim(dir: &Path, sink: &str) -> std::io::Result<Instance> {
     // A crashed panel leaves its socket behind.
     let _ = std::fs::remove_file(&socket);
     Ok(Instance::First(UnixListener::bind(&socket)?))
+}
+
+/// Answer each later start with one byte once `show` has asked for the window; a
+/// start that `show` turns down gets no answer.
+fn answer(listener: UnixListener, show: impl Fn() -> bool) {
+    for mut stream in listener.incoming().flatten() {
+        if show() {
+            let _ = stream.write_all(b"1");
+        }
+    }
 }
 
 fn boot() -> (App, Task<Message>) {
@@ -251,13 +279,7 @@ fn boot() -> (App, Task<Message>) {
     *EVENTS.lock().unwrap() = Some(rx);
     if let Some(listener) = listener {
         let tx = tx.clone();
-        std::thread::spawn(move || {
-            for _ in listener.incoming() {
-                if tx.unbounded_send(Message::Show).is_err() {
-                    break;
-                }
-            }
-        });
+        std::thread::spawn(move || answer(listener, move || !QUITTING.load(Ordering::SeqCst) && tx.unbounded_send(Message::Show).is_ok()));
     }
     let samples = tx.clone();
     let backend = Backend {
@@ -394,6 +416,7 @@ impl App {
             Message::Quit => {
                 trace("QUIT");
                 self.quitting = true;
+                QUITTING.store(true, Ordering::SeqCst);
                 // Dropping the backend waits for ffmpeg and the sink: not on this thread.
                 let backend = self.backend.take();
                 let (done, ended) = oneshot::channel();
@@ -1494,10 +1517,27 @@ mod tests {
         // A socket left by a crashed panel does not stop the next one.
         std::fs::write(dir.join("radio-panel-radio-dev.sock"), "").unwrap();
         let Ok(Instance::First(first)) = claim(&dir, "radio-dev") else { panic!("first start") };
+        let (shown, asked) = std::sync::mpsc::channel();
+        std::thread::spawn(move || answer(first, move || shown.send(()).is_ok()));
         assert!(matches!(claim(&dir, "radio-dev"), Ok(Instance::Running)));
-        // The second start connected: the first one is asked to show its window.
-        first.set_nonblocking(true).unwrap();
-        assert!(first.accept().is_ok());
+        // The second start connected: the first one was asked to show its window.
+        assert!(asked.try_recv().is_ok());
+
+        // A panel that is quitting hangs up; the new start waits for it to end and
+        // becomes the panel.
+        let lock = std::fs::File::create(dir.join("radio-panel-radio-dev-q.lock")).unwrap();
+        lock.try_lock().unwrap();
+        let quitting = UnixListener::bind(dir.join("radio-panel-radio-dev-q.sock")).unwrap();
+        std::thread::spawn(move || answer(quitting, || false));
+        let ends = std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(300));
+            drop(lock);
+        });
+        let started = Instant::now();
+        assert!(matches!(claim(&dir, "radio-dev-q"), Ok(Instance::First(_))));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        ends.join().unwrap();
+
         // A panel on another sink is a panel of its own.
         assert!(matches!(claim(&dir, "radio-dev-other"), Ok(Instance::First(_))));
         let _ = std::fs::remove_dir_all(&dir);
