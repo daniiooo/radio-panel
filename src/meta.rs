@@ -413,7 +413,11 @@ impl<F: Fn(Event)> Pusher<F> {
         std::thread::spawn(move || {
             let agent = ureq::Agent::new_with_config(ureq::Agent::config_builder().timeout_global(Some(REQUEST_TIMEOUT)).build());
             let outcome = match agent.get(&url).header("Authorization", &authorization).call() {
-                Ok(_) => Outcome::Sent,
+                // Icecast refuses titles for an Opus mount with a 200 and this message.
+                Ok(mut response) => match response.body_mut().read_to_string() {
+                    Ok(body) if body.contains("will not accept") => Outcome::Failed,
+                    _ => Outcome::Sent,
+                },
                 Err(ureq::Error::StatusCode(500..)) => Outcome::Retry,
                 Err(ureq::Error::StatusCode(_) | ureq::Error::BadUri(_) | ureq::Error::Http(_)) => Outcome::Failed,
                 Err(_) => Outcome::Retry,
@@ -858,6 +862,20 @@ mod tests {
             wait(&events, status("Metadata OK"));
             wait_for("the title on the server", title_arrived);
         }
+        // Icecast takes no titles for an Opus mount; it says so with a 200.
+        for (key, value) in [("port", icecast_port.as_str()), ("user", "source"), ("source_password", PASSWORD), ("mount", "/main.opus")] {
+            config.set("server", key, value);
+        }
+        config.set("audio", "format", "opus");
+        let (tx, stream_events) = channel();
+        let streamer = crate::streamer::spawn(SINK, move |event| drop(tx.send(event)));
+        streamer.send(crate::streamer::Command::GoLive(Box::new(config.clone())));
+        wait_event(&stream_events, 15, "connected", |event| *event == crate::streamer::Event::Connected(true));
+        let (tx, events) = channel();
+        let pusher = spawn(Box::new(config), move |event| drop(tx.send(event)));
+        pusher.send(Command::SetEnabled(true));
+        wait(&events, status("Metadata failed"));
+        drop((pusher, streamer));
         drop(sink);
         let _ = std::fs::remove_dir_all(&d);
     }
