@@ -45,7 +45,7 @@ const DROP: f64 = 0.78;
 /// The main window opens at this size; its height is the least without a scrollbar.
 const MAIN_SIZE: Size = Size::new(460.0, 560.0);
 const TICK: Duration = Duration::from_millis(500);
-/// Longest wait at quit for ffmpeg and the sink to end (the Python app's limit). Past
+/// Longest wait at quit for ffmpeg and the sink to end. Past
 /// it the process exits anyway; the server then removes the sink and ffmpeg gets
 /// SIGTERM.
 const QUIT_TIMEOUT: Duration = Duration::from_secs(7);
@@ -1376,7 +1376,7 @@ mod tests {
             let _ = app.update(Message::Field(section, key, value.into()));
         }
         // Nothing takes effect before the save. The password is not trimmed by it; the
-        // file format drops outer spaces at the next start, as it did for the Python app.
+        // file format drops outer spaces at the next start.
         assert_eq!(app.config.get("server", "host"), "");
         let _ = app.update(Message::Save);
         assert_eq!(app.config.get("server", "source_password"), "p w ");

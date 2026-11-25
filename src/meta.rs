@@ -132,7 +132,7 @@ const DEBOUNCE: Duration = Duration::from_millis(300);
 const INITIAL_PUSH: Duration = Duration::from_secs(2);
 /// How often the player is asked for its title.
 const POLL: Duration = Duration::from_secs(1);
-/// The Python app had no limit; a request that hangs would block all later titles.
+/// Without a limit, a request that hangs would block all later titles.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(10);
 
 struct Pusher<F> {

@@ -18,7 +18,7 @@ pub fn die_with_parent(command: &mut Command) {
 
 /// ffmpeg's pulse input must fail rather than fall back when our sink is missing or
 /// goes away: pipewire-pulse would capture the default sink's monitor instead, so
-/// whatever the desktop plays would go on air (seen 2026-11-21).
+/// whatever the desktop plays would go on air.
 pub fn no_fallback(command: &mut Command) {
     command.env("PULSE_PROP", "node.dont-fallback=true");
 }
