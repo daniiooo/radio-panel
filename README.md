@@ -42,16 +42,12 @@ Environment variables:
 
 ## Tests
 
-`cargo test` also runs live tests. They need `icecast`, `ffmpeg`, `go`, `python3`
-and the PipeWire tools (`pactl`, `pw-cli`, `pw-link`, `pw-cat`, `pw-metadata`).
-They use only `127.0.0.1` and their own null sinks, and play no audio to a real
-device. One test builds a harness around the
-[ingest](https://github.com/example/ingest) proxy (`tests/ingest`); Go
-downloads its modules on the first run.
+`cargo test` also runs live tests. They need `icecast`, `ffmpeg`, `python3` and
+the PipeWire tools (`pactl`, `pw-cli`, `pw-link`, `pw-cat`, `pw-metadata`). They
+use only `127.0.0.1` and their own null sinks, and play no audio to a real device.
 
 Notes on the PipeWire behavior the panel relies on are in
-`docs/pipewire-notes.md`. The ingest rules are in
-`docs/ingest-compat.md`.
+`docs/pipewire-notes.md`.
 
 ## License
 

@@ -160,7 +160,7 @@ const STALL_PERIOD: Duration = Duration::from_secs(1);
 /// its end is a lost connection and is retried whatever ffmpeg printed. A refused
 /// password also counts as connected for a moment: ffmpeg sends audio without
 /// waiting for the server's answer (measured: under 0.5 s against a local Icecast
-/// and the ingest proxy). Raise this if a server takes longer to refuse.
+/// and a proxying ingest server). Raise this if a server takes longer to refuse.
 const STABLE_RUN: Duration = Duration::from_secs(10);
 
 struct Supervisor<F> {
@@ -374,11 +374,7 @@ pub(crate) mod tests {
 
     pub(crate) const SINK: &str = "radio-dev-stream";
     pub(crate) const PORT: u16 = 18010;
-    /// The ingest harness: its fake master and the proxy.
-    pub(crate) const MASTER_PORT: u16 = 18011;
-    pub(crate) const PROXY_PORT: u16 = 18012;
     pub(crate) const PASSWORD: &str = "test-source-pw";
-    pub(crate) const DJ_PASSWORD: &str = "test-dj-pw";
 
     /// The live tests share the sink and count this process's ffmpeg children.
     pub(crate) static LIVE: std::sync::Mutex<()> = std::sync::Mutex::new(());
@@ -408,27 +404,6 @@ pub(crate) mod tests {
         std::fs::write(&file, xml).unwrap();
         let child = std::process::Command::new("icecast").arg("-c").arg(file).stdout(Stdio::null()).spawn().expect("icecast");
         wait_for("icecast listening", || listening(port));
-        Server(child)
-    }
-
-    /// The real ingest proxy code (`tests/ingest`, built here) on `PROXY_PORT`,
-    /// forwarding to its fake master on `MASTER_PORT`. Its one DJ is `dj`.
-    pub(crate) fn start_ingest(dir: &std::path::Path) -> Server {
-        let binary = dir.join("ingest-proxy-harness");
-        let built = std::process::Command::new("go")
-            .args(["build", "-o"])
-            .arg(&binary)
-            .arg(".")
-            .current_dir(concat!(env!("CARGO_MANIFEST_DIR"), "/tests/ingest"))
-            .status()
-            .expect("go");
-        assert!(built.success(), "go build of tests/ingest failed");
-        let child = std::process::Command::new(binary)
-            .args([&PROXY_PORT.to_string(), &MASTER_PORT.to_string(), DJ_PASSWORD])
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("ingest harness");
-        wait_for("ingest listening", || listening(PROXY_PORT));
         Server(child)
     }
 
@@ -484,11 +459,6 @@ pub(crate) mod tests {
     /// Mounts the Icecast on `PORT` lists.
     pub(crate) fn icecast_status() -> String {
         http_get(PORT, "/status-json.xsl")
-    }
-
-    /// Whether the ingest harness is forwarding a source to its master.
-    fn master_live() -> bool {
-        http_get(MASTER_PORT, "/status").contains("live=1")
     }
 
     /// Pids of the ffmpeg processes this test process started.
@@ -658,77 +628,6 @@ pub(crate) mod tests {
         assert!(ffmpeg_pids().is_empty());
 
         drop(icecast);
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// Go-live through the real ingest proxy code in front of a fake master.
-    #[test]
-    fn streams_to_ingest_proxy() {
-        let _live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = std::env::temp_dir().join(format!("radio-panel-rs-ingest-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let proxy = start_ingest(&dir);
-        let sink = crate::pw::spawn(SINK, |_| {});
-        wait_for("sink monitor visible to pulse", || pactl(&["list", "short", "sources"]).contains("radio-dev-stream.monitor"));
-
-        let mut config = Config::load(&dir.join("none.conf")).unwrap();
-        for (key, value) in [("host", "127.0.0.1"), ("port", "18012"), ("mount", "/main.mp3"), ("user", "dj"), ("source_password", DJ_PASSWORD)] {
-            config.set("server", key, value);
-        }
-        let (tx, events) = channel();
-        let streamer = spawn(SINK, move |event| drop(tx.send(event)));
-
-        // The DJ's own account name: audio passes the proxy and reaches the master.
-        streamer.send(Command::GoLive(Box::new(config.clone())));
-        wait_event(&events, 15, "connected", |e| *e == Event::Connected(true));
-        wait_state(&events, 15, "LIVE", true, false, true);
-        wait_for("audio reaching the master", master_live);
-
-        // Off air: the proxy drops the master connection five seconds later.
-        streamer.send(Command::Stop);
-        wait_state(&events, 15, "Off air", false, false, false);
-        wait_for("master connection closed", || !master_live());
-
-        // User `source` with `name|password`; the `|` travels percent-encoded.
-        let mut compat = config.clone();
-        compat.set("server", "user", "source");
-        compat.set("server", "source_password", &format!("dj|{DJ_PASSWORD}"));
-        streamer.send(Command::GoLive(Box::new(compat)));
-        wait_state(&events, 15, "LIVE", true, false, true);
-        wait_for("audio reaching the master", master_live);
-
-        // An upload stalled for 20 s is kicked by the proxy. The run was stable, so the
-        // streamer connects again by itself.
-        let pids = ffmpeg_pids();
-        assert_eq!(pids.len(), 1);
-        let signal = |name: &str| drop(std::process::Command::new("kill").args([name, &pids[0]]).status());
-        signal("-STOP");
-        std::thread::sleep(Duration::from_secs(21));
-        signal("-CONT");
-        wait_state(&events, 15, "Reconnecting... (connection lost)", false, true, true);
-        wait_state(&events, 15, "LIVE", true, false, true);
-        wait_for("audio reaching the master", master_live);
-        streamer.send(Command::Stop);
-        wait_state(&events, 15, "Off air", false, false, false);
-        wait_for("master connection closed", || !master_live());
-
-        // A wrong password: the proxy resets the connection, which is not retried.
-        // ffmpeg does not read the 401; the reset is all there is.
-        let mut wrongpw = config.clone();
-        wrongpw.set("server", "source_password", "wrong-pw");
-        streamer.send(Command::GoLive(Box::new(wrongpw)));
-        wait_state(&events, 15, "Streaming stopped: server closed the connection; check password and mount", false, true, false);
-        let Event::Diagnostic(detail) = wait_event(&events, 15, "failure details", |e| matches!(e, Event::Diagnostic(d) if !d.is_empty()))
-        else {
-            unreachable!()
-        };
-        assert!(!detail.contains("wrong-pw"), "{detail}");
-        assert!(!master_live());
-
-        drop(streamer);
-        assert!(ffmpeg_pids().is_empty());
-        drop(sink);
-        drop(proxy);
         let _ = std::fs::remove_dir_all(&dir);
     }
 

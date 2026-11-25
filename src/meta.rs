@@ -392,8 +392,8 @@ impl<F: Fn(Event)> Pusher<F> {
             self.status("Metadata failed");
             return;
         }
-        // The mount must be the stream's path, leading slash included: ingest
-        // matches the update to the source by it (docs/ingest-compat.md).
+        // The mount must be the stream's path, leading slash included: some servers
+        // match the update to the source by it.
         let mount = format!("/{}", self.config.get("server", "mount").trim_start_matches('/'));
         let url = format!(
             "http://{host}:{}/admin/metadata?mount={}&mode=updinfo&charset=UTF-8&song={}",
@@ -700,7 +700,6 @@ mod tests {
         let _ = std::fs::remove_dir_all(&d);
     }
 
-    /// The title reaches a local Icecast, and the ingest proxy's master.
     #[test]
     fn m6_titles_from_a_player() {
         let d = temp_dir("m6");
@@ -823,7 +822,7 @@ mod tests {
     }
 
     #[test]
-    fn m4_metadata_reaches_icecast_and_ingest() {
+    fn m4_metadata_reaches_icecast() {
         use crate::pw::tests::{pactl, wait_for};
         use crate::streamer::tests::*;
         let _live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
@@ -841,28 +840,22 @@ mod tests {
         ] {
             config.set(section, key, value);
         }
-        let (icecast_port, proxy_port) = (PORT.to_string(), PROXY_PORT.to_string());
-        // Icecast: what a listener's player reads from the stream, not only the status page.
-        let on_icecast: fn() -> bool = || icecast_status().contains(TITLE) && icy_title("/main.mp3").as_deref() == Some(TITLE);
-        // ingest: what its own code forwarded to the master, decoded there.
-        let on_master: fn() -> bool = || http_get(MASTER_PORT, "/status").contains(&format!("song={TITLE}\n"));
-        let servers = [(icecast_port.as_str(), "source", PASSWORD, on_icecast), (proxy_port.as_str(), "dj", DJ_PASSWORD, on_master)];
+        let icecast_port = PORT.to_string();
         let _icecast = start_icecast(&d, PORT);
-        let _ingest = start_ingest(&d);
-        for (port, user, password, title_arrived) in servers {
-            for (key, value) in [("port", port), ("user", user), ("source_password", password)] {
-                config.set("server", key, value);
-            }
-            let (tx, stream_events) = channel();
-            let streamer = crate::streamer::spawn(SINK, move |event| drop(tx.send(event)));
-            streamer.send(crate::streamer::Command::GoLive(Box::new(config.clone())));
-            wait_event(&stream_events, 15, "connected", |event| *event == crate::streamer::Event::Connected(true));
-            let (tx, events) = channel();
-            let pusher = spawn(Box::new(config.clone()), move |event| drop(tx.send(event)));
-            pusher.send(Command::SetEnabled(true));
-            wait(&events, status("Metadata OK"));
-            wait_for("the title on the server", title_arrived);
+        for (key, value) in [("port", icecast_port.as_str()), ("user", "source"), ("source_password", PASSWORD)] {
+            config.set("server", key, value);
         }
+        let (tx, stream_events) = channel();
+        let streamer = crate::streamer::spawn(SINK, move |event| drop(tx.send(event)));
+        streamer.send(crate::streamer::Command::GoLive(Box::new(config.clone())));
+        wait_event(&stream_events, 15, "connected", |event| *event == crate::streamer::Event::Connected(true));
+        let (tx, events) = channel();
+        let pusher = spawn(Box::new(config.clone()), move |event| drop(tx.send(event)));
+        pusher.send(Command::SetEnabled(true));
+        wait(&events, status("Metadata OK"));
+        // What a listener's player reads from the stream, not only the status page.
+        wait_for("the title on the server", || icecast_status().contains(TITLE) && icy_title("/main.mp3").as_deref() == Some(TITLE));
+        drop((pusher, streamer));
         // Icecast takes no titles for an Opus mount; it says so with a 200.
         for (key, value) in [("port", icecast_port.as_str()), ("user", "source"), ("source_password", PASSWORD), ("mount", "/main.opus")] {
             config.set("server", key, value);

@@ -38,7 +38,7 @@ const BOLD: Font = Font { weight: iced::font::Weight::Bold, ..Font::DEFAULT };
 
 /// Upload rate samples kept for the network graph: 60 s at one per 200 ms.
 const HISTORY: usize = 300;
-/// the old client's "Poor Connection" and "Connection Lost" shares of the target bitrate.
+/// "Poor connection" and "connection lost" shares of the target bitrate.
 const POOR: f64 = 0.92;
 const DROP: f64 = 0.78;
 /// How often deadlines and the silence warning are checked.
