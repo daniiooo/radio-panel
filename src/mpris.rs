@@ -104,6 +104,7 @@ pub(crate) mod tests {
         assert_eq!(player_id("org.mpris.MediaPlayer2.AIMP"), Some("AIMP"));
         assert_eq!(player_id("org.mpris.MediaPlayer2.chromium.instance20954"), Some("chromium"));
         assert_eq!(player_id("org.mpris.MediaPlayer2.kdeconnect.mpris_000001"), Some("kdeconnect.mpris_000001"));
+        assert_eq!(player_id("org.mpris.MediaPlayer2.vlc.instancex1"), Some("vlc.instancex1"));
         assert_eq!(player_id("org.mpris.MediaPlayer2."), None);
         assert_eq!(player_id("org.kde.StatusNotifierItem-1-1"), None);
     }

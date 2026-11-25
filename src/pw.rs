@@ -808,6 +808,21 @@ Output/Audio:application.name:other={"target":"radio2"}
     }
 
     #[test]
+    fn volume_is_the_loudest_channel_volume() {
+        // Props also carry softVolumes; only channelVolumes is the volume pactl shows.
+        let object = Value::Object(Object {
+            type_: spa::utils::SpaTypes::ObjectParamProps.as_raw(),
+            id: ParamType::Props.as_raw(),
+            properties: vec![
+                Property::new(spa::sys::SPA_PROP_softVolumes, Value::ValueArray(ValueArray::Float(vec![1.0, 1.0]))),
+                Property::new(spa::sys::SPA_PROP_channelVolumes, Value::ValueArray(ValueArray::Float(vec![0.125, 0.5]))),
+            ],
+        });
+        let bytes = PodSerializer::serialize(Cursor::new(Vec::new()), &object).unwrap().0.into_inner();
+        assert_eq!(volume_percent(Pod::from_bytes(&bytes).unwrap()), Some(79));
+    }
+
+    #[test]
     fn percent_mapping_matches_pactl() {
         assert_eq!(linear_to_percent(0.5), 79);
         assert_eq!(linear_to_percent(1.0), 100);

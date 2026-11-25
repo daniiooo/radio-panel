@@ -255,7 +255,7 @@ mod tests {
         let path = dir.join("radio-panel.conf");
         fs::write(
             &path,
-            "[server]\nhost = 127.0.0.1\nsource_password = a%%b\nstream_url = \n",
+            "[server]\nhost = 127.0.0.1\nsource_password = a%%b\nstream_url = \nstream_name = \"My Show\"\n",
         )
         .unwrap();
 
@@ -263,6 +263,8 @@ mod tests {
         assert_eq!(cfg.get("server", "stream_url"), "");
         assert_eq!(cfg.get("server", "host"), "127.0.0.1");
         assert_eq!(cfg.get("server", "source_password"), "a%b");
+        // Python's configparser keeps quotes around a value.
+        assert_eq!(cfg.get("server", "stream_name"), "\"My Show\"");
         assert_eq!(cfg.get("server", "port"), "8000");
         cleanup(&dir);
     }

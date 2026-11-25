@@ -880,4 +880,81 @@ mod tests {
         drop(sink);
         let _ = std::fs::remove_dir_all(&d);
     }
+
+    /// The answer bookkeeping, without threads or a server: requests go to a socket
+    /// that takes them and never answers, the test hands in the answers itself.
+    #[test]
+    fn m7_answers_count_only_for_the_current_title() {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let mut config = Config::load(std::path::Path::new("/nonexistent/radio-panel-test.conf")).unwrap();
+        config.set("server", "host", "127.0.0.1");
+        config.set("server", "port", &listener.local_addr().unwrap().port().to_string());
+        let statuses = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let log = statuses.clone();
+        let last_status = || statuses.lock().unwrap().last().cloned().unwrap_or_default();
+        let (tx, _rx) = channel();
+        let mut p = Pusher {
+            on_event: move |event| {
+                if let Event::Status(text) = event {
+                    log.lock().unwrap().push(text);
+                }
+            },
+            tx,
+            config: Box::new(config),
+            watcher: None,
+            poller: None,
+            enabled: false,
+            automatic_title: None,
+            manual_title: None,
+            last_pushed: None,
+            generation: 0,
+            requests: 0,
+            inflight: None,
+            pending: false,
+            pending_force: false,
+            retry_index: 0,
+            debounce_at: None,
+            initial_at: None,
+            retry_at: None,
+            titles: None,
+        };
+        p.set_enabled(true);
+        // The first push waits for the server to register the mount.
+        assert!(p.initial_at.is_some_and(|at| at > Instant::now()));
+        p.set_manual_title("A");
+        let (first, generation) = (p.inflight.expect("A was sent"), p.generation);
+        // Asked again while that request runs: queued, and it stays forced.
+        p.push_current(true);
+        assert!(p.pending && p.pending_force);
+        // The answer for A arrives; the queued push follows as a request of its own.
+        p.done(first, "A".into(), generation, Outcome::Sent);
+        assert_eq!(p.last_pushed.as_deref(), Some("A"));
+        let second = p.inflight.expect("the queued push was sent");
+        assert_ne!(second, first);
+
+        // An answer from before the last change says nothing, even for the same title
+        // (B, then C, then B again).
+        p.set_manual_title("B");
+        p.done(second, "B".into(), generation, Outcome::Sent);
+        assert_eq!(p.last_pushed.as_deref(), Some("A"));
+        // The title it was not about is sent now.
+        let mut request = p.inflight.expect("B was sent");
+        assert_ne!(request, second);
+
+        // No answer: four retries with growing waits, then it gives up.
+        for wait in [2, 5, 10, 30] {
+            let generation = p.generation;
+            p.done(request, "B".into(), generation, Outcome::Retry);
+            assert_eq!(last_status(), format!("Retrying metadata ({wait}s)"));
+            assert!(p.inflight.is_none() && p.retry_at.is_some());
+            // The retry is due.
+            p.retry_at = None;
+            p.push_current(false);
+            request = p.inflight.expect("retried");
+        }
+        let generation = p.generation;
+        p.done(request, "B".into(), generation, Outcome::Retry);
+        assert_eq!(last_status(), "Metadata failed");
+        drop(listener);
+    }
 }

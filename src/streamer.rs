@@ -570,6 +570,21 @@ pub(crate) mod tests {
         wait_event(&events, 15, "details cleared", |e| *e == Event::Diagnostic(String::new()));
         assert_eq!(ffmpeg_pids(), pids);
 
+        // Stop and go live at once: the old ffmpeg's exit, reported late, must not
+        // count as the new one failing; nor is LIVE announced again with each progress
+        // report.
+        streamer.send(Command::Stop);
+        streamer.send(Command::GoLive(Box::new(config.clone())));
+        wait_state(&events, 15, "LIVE", true, false, true);
+        let quiet = Instant::now() + Duration::from_secs(3);
+        while let Some(left) = quiet.checked_duration_since(Instant::now()) {
+            if let Ok(event) = events.recv_timeout(left) {
+                assert!(!matches!(event, Event::State { .. } | Event::Connected(_)), "{event:?}");
+            }
+        }
+        let pids = ffmpeg_pids();
+        assert_eq!(pids.len(), 1);
+
         // A frozen ffmpeg reports no progress: the rate drops to zero, then resumes.
         let signal = |name: &str| drop(std::process::Command::new("kill").args([name, &pids[0]]).status());
         signal("-STOP");

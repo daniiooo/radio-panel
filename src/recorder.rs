@@ -423,6 +423,8 @@ mod tests {
         let first = next();
         assert!(first.starts_with("Recording: My_Show-") && first.ends_with(".mp3"), "{first}");
         let first = folder.join(first.trim_start_matches("Recording: "));
+        // A second Start while recording keeps the one ffmpeg.
+        recorder.send(Command::Start(Box::new(config.clone())));
         for title in ["Artist - Title", "Artist - Title", "", "Two\nLines"] {
             recorder.send(Command::SetTitle(title.into()));
         }

@@ -262,5 +262,20 @@ mod tests {
         assert!(!s.advance(11.0));
         assert!(!s.advance(11.2));
         assert!(s.is_idle(11.2));
+        // Silence that still arrives is not idle until it has stopped for 0.25 s.
+        let mut s = Spectrum::new(44100);
+        s.add_samples(&vec![0.0; FFT], 20.0);
+        assert!(!s.is_idle(20.1));
+        assert!(s.is_idle(20.3));
+    }
+
+    #[test]
+    fn s6_falling_peak_alone_is_a_change() {
+        let mut s = Spectrum::new(44100);
+        s.last_advance = Some(0.0);
+        s.last_sample = Some(0.0);
+        s.peaks[3] = 0.5;
+        assert!(s.advance(0.1));
+        assert!(close(s.peaks[3], 0.425));
     }
 }
