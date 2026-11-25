@@ -452,6 +452,12 @@ mod tests {
 
     #[test]
     fn t6_scrub_diagnostic() {
+        // A URL at the very end, with or without a path.
+        let c = cfg(&[]);
+        for text in ["to icecast://127.0.0.1", "to icecast://127.0.0.1:8000/", "http://a"] {
+            assert_eq!(scrub_diagnostic(&c, text), text);
+        }
+
         // (i)
         let c = cfg(&[
             ("server", "user", "dj name"),
@@ -520,6 +526,8 @@ mod tests {
     fn t9_ffmpeg_sends_the_real_credentials() {
         use base64::Engine;
         use std::io::Read;
+        // Its ffmpeg is a child of the test process, like the live tests' own.
+        let _live = crate::streamer::tests::LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         for (user, password) in [("dj name", "p@ss/w:rd"), ("ハチ", "pä%ss#?&+ :x"), ("source", "dj|pw")] {
             let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
             let port = listener.local_addr().unwrap().port().to_string();
@@ -621,5 +629,94 @@ mod tests {
         assert_eq!(classify_diagnostic(ingest_opus, "radio-dev"), closed);
         let icecast_mp3 = "[aost#0:0/libmp3lame @ 0x1] Error submitting a packet to the muxer: Broken pipe\n[out#0/mp3 @ 0x2] Error closing file: Broken pipe";
         assert_eq!(classify_diagnostic(icecast_mp3, "radio-dev"), closed);
+
+        // Every phrase matches on its own.
+        let occupied = ("mount already occupied", false);
+        let auth = ("authentication failed", false);
+        let encoder = ("ffmpeg encoder unavailable", false);
+        let pulse = ("Pulse stream source unavailable", false);
+        let network = ("network connection failed", true);
+        for (text, expected) in [
+            ("Mountpoint in use", occupied),
+            ("mountpoint already used", occupied),
+            ("Mountpoint is occupied", occupied),
+            ("mount point in use", occupied),
+            ("mount already taken", occupied),
+            ("source already in use", occupied),
+            ("already occupied", occupied),
+            ("already taken", occupied),
+            ("409 Conflict", occupied),
+            ("401", auth),
+            ("Unauthorized", auth),
+            ("Authentication failed", auth),
+            ("Access denied", auth),
+            ("Unknown encoder 'x'", encoder),
+            ("Error selecting an encoder", encoder),
+            ("libmp3lame", encoder),
+            ("ffmpeg error: execvp", encoder),
+            ("ffmpeg error: could not start", encoder),
+            ("execvp: No such file", encoder),
+            ("ffmpeg not found", encoder),
+            ("pulse: No such entity", pulse),
+            ("pulse source not found", pulse),
+            ("pulse: Invalid argument", pulse),
+            ("pulse: failed to open", pulse),
+            ("radio-dev.monitor: No such device", pulse),
+            ("Invalid argument", ("stream process exited", true)),
+            ("No such device", ("stream process exited", true)),
+            ("Name or service not known", network),
+            ("Failed to resolve hostname", network),
+            ("Connection refused", network),
+            ("Connection timed out", network),
+            ("timeout", network),
+            ("Network is unreachable", network),
+            ("connection reset", network),
+        ] {
+            assert_eq!(classify_diagnostic(text, "radio-dev"), expected, "{text}");
+        }
+        // A code is a number of its own, also at the very start or end.
+        assert!(has_code("401 unauthorized", "401"));
+        assert!(has_code("error 401", "401"));
+        assert!(!has_code("port 4013", "401"));
+        assert!(!has_code("port 1401", "401"));
+    }
+
+    #[test]
+    fn t10_terminate_waits_then_kills() {
+        use std::os::unix::process::ExitStatusExt;
+        // Ends a moment after SIGTERM, as ffmpeg does while it finishes its file.
+        let mut child = Command::new("sh").args(["-c", "trap 'kill $!; sleep 0.3; exit 7' TERM; sleep 10 & wait"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        terminate(&mut child, Duration::from_secs(3));
+        assert_eq!(child.try_wait().unwrap().and_then(|status| status.code()), Some(7));
+        // One that ignores SIGTERM is killed once the grace time is over.
+        let mut child = Command::new("sh").args(["-c", "trap '' TERM; sleep 1 & wait"]).spawn().unwrap();
+        std::thread::sleep(Duration::from_millis(200));
+        let started = Instant::now();
+        terminate(&mut child, Duration::from_millis(300));
+        assert!(started.elapsed() >= Duration::from_millis(300));
+        assert_eq!(child.try_wait().unwrap().and_then(|status| status.signal()), Some(libc::SIGKILL));
+    }
+
+    #[test]
+    fn t11_child_dies_with_the_thread_that_started_it() {
+        use std::os::unix::process::ExitStatusExt;
+        let mut child = std::thread::spawn(|| {
+            let mut command = Command::new("sleep");
+            command.arg("10");
+            die_with_parent(&mut command);
+            command.spawn().unwrap()
+        })
+        .join()
+        .unwrap();
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while child.try_wait().unwrap().is_none() {
+            if Instant::now() > deadline {
+                let _ = child.kill();
+                panic!("the child outlived its thread");
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        assert_eq!(child.try_wait().unwrap().and_then(|status| status.signal()), Some(libc::SIGTERM));
     }
 }
