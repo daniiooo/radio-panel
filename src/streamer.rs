@@ -492,7 +492,7 @@ pub(crate) mod tests {
     #[test]
     fn streams_to_local_icecast_and_reconnects() {
         let _live = LIVE.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        let dir = std::env::temp_dir().join(format!("radio-panel-rs-streamer-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("radio-panel-test-streamer-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let sink = crate::pw::spawn(SINK, |_| {});
         wait_for("sink monitor visible to pulse", || pactl(&["list", "short", "sources"]).contains("radio-dev-stream.monitor"));

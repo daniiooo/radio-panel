@@ -1299,7 +1299,7 @@ mod tests {
     use super::*;
 
     fn config_file(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("radio-panel-rs-ui-{name}-{}.conf", std::process::id()))
+        std::env::temp_dir().join(format!("radio-panel-test-ui-{name}-{}.conf", std::process::id()))
     }
 
     fn app(name: &str) -> App {
@@ -1521,7 +1521,7 @@ mod tests {
 
     #[test]
     fn u10_a_second_start_shows_the_first_panel() {
-        let dir = std::env::temp_dir().join(format!("radio-panel-rs-ui-u10-{}", std::process::id()));
+        let dir = std::env::temp_dir().join(format!("radio-panel-test-ui-u10-{}", std::process::id()));
         let _ = std::fs::remove_dir_all(&dir);
         std::fs::create_dir_all(&dir).unwrap();
         // A socket left by a crashed panel does not stop the next one.

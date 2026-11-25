@@ -4,6 +4,8 @@ A small tray panel for live radio streaming on Linux with PipeWire. While it run
 it provides an output named "Radio Stream". Whatever plays into that output is sent
 to an Icecast-compatible server through ffmpeg.
 
+![The main window, live](docs/screenshot.png)
+
 - Go live with MP3, Opus or Vorbis. A lost connection is retried with backoff.
 - Track titles come from a text file or from a media player over MPRIS, and are sent
   to the server as stream metadata. Titles can also be typed by hand.
@@ -21,15 +23,31 @@ to an Icecast-compatible server through ffmpeg.
 - To build: a Rust toolchain (edition 2024), the PipeWire development files,
   `clang` and `pkg-config`.
 
-## Build and run
+## Install
 
 ```
-cargo build --release
-target/release/radio-panel
+cargo install --locked --git https://github.com/daniiooo/radio-panel
 ```
+
+This puts the binary in `~/.cargo/bin/radio-panel`. For an application menu entry:
+
+```
+cat > ~/.local/share/applications/radio-panel.desktop <<EOF
+[Desktop Entry]
+Type=Application
+Name=Radio Panel
+Exec=$HOME/.cargo/bin/radio-panel
+Icon=multimedia-volume-control
+Categories=AudioVideo;Audio;
+StartupNotify=false
+EOF
+```
+
+## Usage
 
 Route a player to "Radio Stream" once, for example in pavucontrol. WirePlumber
-remembers that route and restores it each time the panel starts.
+remembers that route and restores it each time the panel starts. Enter the server
+under Settings and press Go Live.
 
 Settings are stored in `~/.config/radio-panel.conf`. The file holds the source
 password and is written with mode 0600.
